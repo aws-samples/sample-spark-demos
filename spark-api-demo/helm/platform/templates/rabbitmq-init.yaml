@@ -1,0 +1,61 @@
+# Declares the RabbitMQ objects the upstream scaffolding consumers expect
+# at startup. request-proxy and xoev-adapter unconditionally consume the
+# hardcoded "test.queue" bound to "test.exchange" (upstream scaffolding;
+# consume_queue passively declares BOTH and crashes when either is missing
+# — observed: ChannelNotFoundEntity "no exchange 'test.exchange'" after the
+# queue alone was declared; without AMQP_URL they default to localhost and
+# crash too). Mirrors upstream request-proxy scripts/rabbitmq_local_setup.py
+# 1:1 (fanout exchange, durable queue, empty routing key binding).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rabbitmq-init
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 10
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "rabbitmq-init" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: public.ecr.aws/docker/library/alpine:3.20
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              apk add --no-cache curl >/dev/null
+              echo "waiting for rabbitmq management API"
+              for i in $(seq 1 60); do
+                curl -fsS -u "$RMQ_USER:$RMQ_PASS" http://rabbitmq:15672/api/overview >/dev/null 2>&1 && break
+                sleep 5
+              done
+              echo "declaring test.queue (idempotent PUT)"
+              curl -fsS -u "$RMQ_USER:$RMQ_PASS" -X PUT \
+                -H 'Content-Type: application/json' \
+                -d '{"durable": true}' \
+                http://rabbitmq:15672/api/queues/%2f/test.queue
+              echo "declaring test.exchange (idempotent PUT)"
+              curl -fsS -u "$RMQ_USER:$RMQ_PASS" -X PUT \
+                -H 'Content-Type: application/json' \
+                -d '{"type": "fanout", "durable": true}' \
+                http://rabbitmq:15672/api/exchanges/%2f/test.exchange
+              echo "binding test.queue to test.exchange (idempotent for identical args)"
+              curl -fsS -u "$RMQ_USER:$RMQ_PASS" -X POST \
+                -H 'Content-Type: application/json' \
+                -d '{"routing_key": ""}' \
+                http://rabbitmq:15672/api/bindings/%2f/e/test.exchange/q/test.queue
+              echo "rabbitmq-init done"
+          env:
+            - name: RMQ_USER
+              valueFrom: { secretKeyRef: { name: rabbitmq, key: username } }
+            - name: RMQ_PASS
+              valueFrom: { secretKeyRef: { name: rabbitmq, key: password } }

@@ -1,0 +1,74 @@
+{{- if .Values.dbInit.enabled }}
+# Creates the application role and one database per service on RDS.
+# Idempotent (checks before create); pre-install/pre-upgrade hook so the
+# databases exist before the umbrella's services boot and run their
+# startup migrations.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  init.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    export PGHOST="{{ .Values.rds.host }}" PGPORT="{{ .Values.rds.port }}" PGUSER="$MASTER_USER" PGPASSWORD="$MASTER_PASSWORD"
+
+    echo "Waiting for RDS ..."
+    for i in $(seq 1 60); do pg_isready -d postgres && break; sleep 5; done
+
+    echo "Ensuring application role"
+    psql -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname = '$APP_USER'" | grep -q 1 || \
+      psql -d postgres -c "CREATE ROLE \"$APP_USER\" LOGIN PASSWORD '$APP_PASSWORD'"
+    psql -d postgres -c "ALTER ROLE \"$APP_USER\" WITH LOGIN PASSWORD '$APP_PASSWORD'"
+
+    for db in {{ join " " .Values.dbInit.databases }}; do
+      echo "Ensuring database $db"
+      psql -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '$db'" | grep -q 1 || \
+        psql -d postgres -c "CREATE DATABASE \"$db\" OWNER \"$APP_USER\""
+      psql -d "$db" -c "GRANT ALL ON SCHEMA public TO \"$APP_USER\""
+    done
+    echo "db-init finished."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "db-init" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: db-init
+          image: {{ .Values.dbInit.image }}
+          command: ["/bin/bash", "/scripts/init.sh"]
+          env:
+            - name: MASTER_USER
+              valueFrom: { secretKeyRef: { name: rds-master, key: username } }
+            - name: MASTER_PASSWORD
+              valueFrom: { secretKeyRef: { name: rds-master, key: password } }
+            - name: APP_USER
+              valueFrom: { secretKeyRef: { name: rds-app, key: username } }
+            - name: APP_PASSWORD
+              valueFrom: { secretKeyRef: { name: rds-app, key: password } }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: db-init, defaultMode: 0755 }
+{{- end }}

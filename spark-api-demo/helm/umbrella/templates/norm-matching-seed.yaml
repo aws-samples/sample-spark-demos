@@ -1,0 +1,83 @@
+{{- $svc := index .Values.services "norm-matching" }}
+{{- if $svc.enabled }}
+# The Materielle-Pruefung MFE lists "applications" per proposal from
+# norm-matching, but ships NO create-application UI — applications must
+# exist server-side (observed: GET /api/v1/proposals/{id}/applications
+# 404 on every fixed Verfahren, the MP page rendered an empty skeleton
+# forever). Seeds one application per fixed frontend Verfahren through
+# the service's own API (service logic sets ASSIGNED state and audit
+# events). Idempotent: skips proposals that already have applications.
+# Norm-chain content stays empty — upstream ships no legal-norm seed
+# data (rechtsquellenvorbereitung pipeline input is not included).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: norm-matching-seed
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "7"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {{- include "spark-api.selectorLabels" "norm-matching-seed" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          # alpine/k8s ships bash + curl (verified in-cluster; kubectl
+          # images on public.ecr.aws are distroless or missing).
+          image: docker.io/alpine/k8s:1.31.13
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              HOST="http://norm-matching.{{ .Release.Namespace }}.svc.cluster.local"
+              BASE="$HOST/api/v1"
+              echo "waiting for norm-matching /health"
+              for i in $(seq 1 60); do
+                curl -sf "$HOST/health" -o /dev/null && break
+                sleep 5
+              done
+              seed() {
+                local pid="$1" name="$2"
+                local list code
+                list=$(curl -s -o /tmp/list.json -w "%{http_code}" "$BASE/proposals/$pid/applications")
+                if [ "$list" = "200" ] && grep -q '"application_id"' /tmp/list.json; then
+                  echo "$pid: application already present"
+                  return 0
+                fi
+                code=$(curl -s -o /tmp/create.json -w "%{http_code}" \
+                  -X POST -H "Content-Type: application/json" \
+                  -d "{\"application_name\": \"$name\"}" \
+                  "$BASE/proposals/$pid/applications")
+                if [ "$code" = "201" ]; then
+                  echo "$pid: application created"
+                else
+                  echo "$pid: create failed ($code): $(cat /tmp/create.json)" >&2
+                  return 1
+                fi
+              }
+              seed 399dc7e9-5dd2-4fb4-ba5a-967d8fd0b298 "Antrag Testverfahren (Default)"
+              seed f3c9a1e2-7b4e-4b9f-9c4e-2f8d3a1c9b7e "Antrag Testverfahren 1"
+              seed a7d2c5f1-3e6b-4c2a-8f9e-1d4b7e9c2a3f "Antrag Testverfahren 2"
+              seed e9b1d7c4-2f3a-4c8e-9b1a-7d6f2e3c1b9a "Antrag Testverfahren 3"
+              seed 5386e53e-6117-4748-a810-221eae2f7bf2 "Antrag Testverfahren 4"
+              seed c265b10b-9990-4c78-93cd-871642f303e3 "Antrag Testverfahren 5"
+              seed a7830304-a114-484d-a16d-5aa6545a8643 "Antrag Testverfahren 6"
+              seed 9e9d8817-1e6f-47d8-9f32-8ee40aa3cc75 "Antrag Testverfahren 7"
+              seed e7de5681-2fe6-4f0b-befb-330578883dbb "Antrag Testverfahren 8"
+              seed 091f4776-a2e2-4a72-9b12-fcf3c871166f "Antrag Testverfahren 9"
+              seed b3b63226-a19c-4ab8-b6e8-31c5f3c4b42e "Antrag Testverfahren 10"
+              seed d10eb301-61a3-4dee-ad54-4cf15772f735 "Antrag Testverfahren 11"
+              seed 1ba63550-5e98-45af-a638-c67dd1f8683b "Antrag Testverfahren 12"
+              seed 93db7ab7-5eab-4229-90e5-b7708a85b075 "Antrag Testverfahren 13"
+              seed 257144c0-021e-43d9-9401-1724b04d590d "Antrag Testverfahren 14"
+              seed 239a64f2-6a3d-45e6-9487-6aefbeef6110 "Antrag Testverfahren 15"
+              echo "norm-matching seed done"
+{{- end }}

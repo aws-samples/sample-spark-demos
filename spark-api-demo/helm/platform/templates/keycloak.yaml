@@ -1,0 +1,78 @@
+{{- if .Values.auth.enabled }}
+# Keycloak, demo-grade single replica — the OSS OIDC perimeter for the API
+# demo. SPARK API v0.4.x ships no auth (upstream delegates it to the
+# demosplan platform, outside demo scope v1), so the demo authenticates at
+# the edge: ingress-nginx external-auth -> oauth2-proxy -> this Keycloak.
+# Pattern ported from spark-workflow-demo (Keycloak 26, xforwarded proxy
+# headers, RDS persistence; TLS terminates at ingress-nginx).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-api-platform.selectorLabels" "keycloak" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "keycloak" | nindent 8 }}
+    spec:
+      containers:
+        - name: keycloak
+          image: {{ .Values.auth.keycloak.image }}
+          args:
+            - start
+            - --http-enabled=true
+            - --http-port=8080
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://{{ .Values.rds.host }}:{{ .Values.rds.port }}/keycloak
+            # Demo pragmatism: Keycloak persists with the shared app role
+            # (db-init creates the `keycloak` database like every other).
+            - name: KC_DB_USERNAME
+              valueFrom: { secretKeyRef: { name: rds-app, key: username } }
+            - name: KC_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: rds-app, key: password } }
+            - name: KC_HOSTNAME
+              value: https://{{ .Values.auth.host }}
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: keycloak-credentials, key: admin_password } }
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_HTTP_MANAGEMENT_PORT
+              value: "9000"
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: management, containerPort: 9000 }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: management }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /health/live, port: management }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          resources: {{- toYaml .Values.auth.keycloak.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-api-platform.selectorLabels" "keycloak" | nindent 4 }}
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+{{- end }}

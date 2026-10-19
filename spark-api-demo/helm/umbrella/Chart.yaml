@@ -1,0 +1,13 @@
+apiVersion: v2
+name: spark-api-demo
+description: >
+  Demo umbrella for the SPARK API service suite: renders one generic
+  Deployment/Service per upstream service from a central wiring matrix
+  (values.yaml), consolidated nginx ingress on one host, images from the
+  demo's ECR registry (built unmodified from the upstream sources).
+  Deliberately no file:// dependencies on the upstream scaffold charts:
+  their hardcoded env blocks miss the services' real config contracts.
+  Demo-grade, MIT-0.
+type: application
+version: 0.2.15
+appVersion: "0.1.0"

@@ -1,0 +1,65 @@
+# Single-node RabbitMQ StatefulSet (official image), deliberately NOT the
+# RabbitMQ Cluster Operator: the operator adds CRD lifecycle for zero demo
+# benefit — one broker node satisfies every upstream client.
+# The bizlog shared lib connects via plain AMQP host/port (no TLS/creds
+# options), so the broker also has to accept the demo user's plain login
+# cluster-internally; AMQP_URL-based services use an AMQP URL that carries
+# the same generated credentials (secrets module, key `url`).
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-api-platform.selectorLabels" "rabbitmq" | nindent 4 }}
+  ports:
+    - { name: amqp, port: 5672, targetPort: amqp }
+    - { name: management, port: 15672, targetPort: management }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-api-platform.selectorLabels" "rabbitmq" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "rabbitmq" | nindent 8 }}
+    spec:
+      {{- if .Values.statefulPool }}
+      {{- include "spark-api-platform.statefulPlacement" . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: rabbitmq
+          image: {{ .Values.rabbitmq.image }}
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom: { secretKeyRef: { name: rabbitmq, key: username } }
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom: { secretKeyRef: { name: rabbitmq, key: password } }
+          ports:
+            - { name: amqp, containerPort: 5672 }
+            - { name: management, containerPort: 15672 }
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "check_port_connectivity"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/rabbitmq }
+          resources: {{- toYaml .Values.rabbitmq.resources | nindent 12 }}
+      volumes: []
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.rabbitmq.storage }}

@@ -1,0 +1,24 @@
+# Builds the frontend monorepo image (npm workspaces, nginx runtime).
+# prepare-context.sh only rewrites the base-image placeholders here (no
+# pyproject.toml in the context). VITE_* values are injected at RUNTIME by
+# the image's docker-entrypoint.sh, so no build args are needed.
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - export GIT_SHA=$(cat SOURCE_VERSION 2>/dev/null || echo unknown)
+      - echo "Building ${IMAGE_NAME} from ${SERVICE_PATH} at ${GIT_SHA}"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+  build:
+    commands:
+      # Same immutable-tag guard as buildspec-service.yml: an existing
+      # content tag is skipped, never re-pushed.
+      - |
+        if aws ecr describe-images --repository-name "$ECR_PREFIX/$IMAGE_NAME" --image-ids imageTag="$GIT_SHA" > /dev/null 2>&1; then
+          echo "Image $ECR_PREFIX/$IMAGE_NAME:$GIT_SHA already exists (immutable, content-addressed) — skipping build"
+        else
+          bash pipeline/prepare-context.sh . "$SERVICE_PATH" /tmp/ctx
+          export DOCKER_BUILDKIT=1
+          docker build -t "$ECR_REGISTRY/$ECR_PREFIX/$IMAGE_NAME:$GIT_SHA" /tmp/ctx
+          docker push "$ECR_REGISTRY/$ECR_PREFIX/$IMAGE_NAME:$GIT_SHA"
+        fi

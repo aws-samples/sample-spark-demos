@@ -1,0 +1,363 @@
+{{- $svc := index .Values.services "dokumentenpruefung" }}
+{{- if $svc.enabled }}
+# The dokumentenpruefung service keeps its own core.antraege plus the
+# Soll-/Ist-Dokumente tables the Vollstaendigkeitspruefung views read.
+# The frontend's fixed Verfahren IDs exist in no backend — every VP view
+# 404ed (observed: soll-dokumente/ist-dokumente/vollstaendigkeitspruefung
+# bursts; the MFE then crashes rendering the 404 body). Registers the
+# fixed IDs and seeds a small Soll/Ist document set per Antrag so the
+# views render AND a Vollstaendigkeitspruefung can be started live —
+# that run (Soll/Ist matching) is the AI moment of this module.
+# Idempotent via ON CONFLICT DO NOTHING; waits for the service's startup
+# migration to create the schema.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dokumentenpruefung-seed
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "6"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 8
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {{- include "spark-api.selectorLabels" "dokumentenpruefung-seed" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: public.ecr.aws/docker/library/postgres:16
+          env:
+            - name: DB_HOST
+              value: {{ get $svc.env "DATABASE_HOST" | quote }}
+            - name: DB_PORT
+              value: {{ get $svc.env "DATABASE_PORT" | quote }}
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: rds-app, key: username } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: rds-app, key: password } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              export PGHOST="$DB_HOST" PGPORT="$DB_PORT" PGDATABASE=dokumentenpruefung \
+                     PGUSER="$DB_USER" PGPASSWORD="$DB_PASSWORD"
+              echo "waiting for core.soll_dokumente (created by the service's startup migration)"
+              for i in $(seq 1 60); do
+                if psql -tAc "select to_regclass('core.soll_dokumente')" | grep -q soll_dokumente; then break; fi
+                sleep 5
+              done
+              # Fail fast instead of blocking: this runs while the service
+              # applies migrations and its startup cleanup, which can hold
+              # table locks (observed: a lock wait consumed the whole job
+              # deadline). Short timeouts + the job's backoffLimit turn the
+              # race into a quick retry.
+              export PGOPTIONS='-c lock_timeout=10s -c statement_timeout=60s'
+              psql -v ON_ERROR_STOP=1 <<'SQL'
+              -- Register the frontend's fixed Antrag IDs.
+              with fixed(id, nr) as (values
+                ('399dc7e9-5dd2-4fb4-ba5a-967d8fd0b298'::uuid, 'ANT-2024-0000'),
+                ('f3c9a1e2-7b4e-4b9f-9c4e-2f8d3a1c9b7e'::uuid, 'ANT-2024-0001'),
+                ('a7d2c5f1-3e6b-4c2a-8f9e-1d4b7e9c2a3f'::uuid, 'ANT-2024-0002'),
+                ('e9b1d7c4-2f3a-4c8e-9b1a-7d6f2e3c1b9a'::uuid, 'ANT-2024-0003'),
+                ('5386e53e-6117-4748-a810-221eae2f7bf2'::uuid, 'ANT-2024-0004'),
+                ('c265b10b-9990-4c78-93cd-871642f303e3'::uuid, 'ANT-2024-0005'),
+                ('a7830304-a114-484d-a16d-5aa6545a8643'::uuid, 'ANT-2024-0006'),
+                ('9e9d8817-1e6f-47d8-9f32-8ee40aa3cc75'::uuid, 'ANT-2024-0007'),
+                ('e7de5681-2fe6-4f0b-befb-330578883dbb'::uuid, 'ANT-2024-0008'),
+                ('091f4776-a2e2-4a72-9b12-fcf3c871166f'::uuid, 'ANT-2024-0009'),
+                ('b3b63226-a19c-4ab8-b6e8-31c5f3c4b42e'::uuid, 'ANT-2024-0010'),
+                ('d10eb301-61a3-4dee-ad54-4cf15772f735'::uuid, 'ANT-2024-0011'),
+                ('1ba63550-5e98-45af-a638-c67dd1f8683b'::uuid, 'ANT-2024-0012'),
+                ('93db7ab7-5eab-4229-90e5-b7708a85b075'::uuid, 'ANT-2024-0013'),
+                ('257144c0-021e-43d9-9401-1724b04d590d'::uuid, 'ANT-2024-0014'),
+                ('239a64f2-6a3d-45e6-9487-6aefbeef6110'::uuid, 'ANT-2024-0015'))
+              insert into core.antraege (id, antragsnummer, erstellt_am, erstellt_von, prozess_status)
+              select id, nr, now(), 'demo-seed', 'in_bearbeitung' from fixed
+              on conflict (id) do nothing;
+
+              -- Soll-Dokumente (expected documents) per Antrag.
+              with fixed(id) as (
+                select id from core.antraege where erstellt_von = 'demo-seed'
+              ), soll(titel, beschreibung, typ, ord) as (values
+                ('Lageplan',              'Amtlicher Lageplan des Vorhabens im Massstab 1:1000.', 'Plan', 1),
+                ('Baubeschreibung',       'Beschreibung des Bauvorhabens mit technischen Angaben.', 'Bericht', 2),
+                ('Schallschutzgutachten', 'Gutachten zum Schallschutz inkl. Tag- und Nachtwerten.', 'Gutachten', 3))
+              insert into core.soll_dokumente (id, antrag_id, titel, beschreibung, dokumenttyp, ist_von_ki_analysiert, erstellt_von, erstellt_am)
+              select md5(f.id::text || '/soll-' || s.ord)::uuid, f.id, s.titel, s.beschreibung, s.typ, false, 'demo-seed', now()
+              from fixed f cross join soll s
+              on conflict (id) do nothing;
+
+              -- Repair seed-owned rows whose document link is missing or
+              -- stale (earlier seed versions used a uuid5 derivation; the
+              -- insert below is ON CONFLICT DO NOTHING, so bad links would
+              -- survive forever). Restricted to the deterministic seed IDs,
+              -- update in place — no FK cascades, fewer lock conflicts with
+              -- the running service.
+              update core.ist_dokumente d
+                 set assoziierte_dokument_id =
+                       md5('spark-api-demo/doc/' || d.antrag_id::text || '/' || m.ord)::uuid,
+                     geloescht_am = null,
+                     geloescht_von = null
+                from (values ('lageplan.pdf', 1), ('baubeschreibung.pdf', 2)) as m(datei, ord)
+               where d.dateiname = m.datei
+                 and d.id = md5(d.antrag_id::text || '/ist-' || m.ord)::uuid
+                 and (d.assoziierte_dokument_id is distinct from
+                        md5('spark-api-demo/doc/' || d.antrag_id::text || '/' || m.ord)::uuid
+                      or d.geloescht_am is not null);
+
+              -- Ist-Dokumente (submitted documents) per Antrag: two of the
+              -- three expected ones, so a Vollstaendigkeitspruefung has a
+              -- real gap to find. assoziierte_dokument_id mirrors the
+              -- data-service seed's derivation — the service's startup
+              -- cleanup soft-deletes any Ist-Dokument whose linked document
+              -- the Dokumentenaufbereitung API does not return.
+              -- markdown_text is fact-dense with ONE deliberate
+              -- contradiction (Gebaeudehoehe 12 m vs 15 m): the
+              -- Konsistenzpruefung extracts facts from these texts and
+              -- cross-checks them — near-empty texts yielded 0 facts and
+              -- the upstream inconsistency batch crashed on the empty list
+              -- (observed: konsistenz FEHLER "All inconsistency analysis
+              -- batches failed"). Text mirrors the data-service demo PDFs.
+              with fixed(id) as (
+                select id from core.antraege where erstellt_von = 'demo-seed'
+              ), ist(datei, titel, beschreibung, md, ord) as (values
+                ('lageplan.pdf', 'Lageplan', 'Amtlicher Lageplan, Massstab 1:1000, Blatt 1-2.',
+                 'Lageplan. Amtlicher Lageplan des Grundstuecks, Massstab 1:1000. '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt, Blatt 1-2. '
+                 || 'Grundstuecksflaeche: 2.400 qm, Baufenster 40 m x 20 m. '
+                 || 'Geplantes Gebaeude: zweigeschossiges Buerogebaeude, Gebaeudehoehe 12 m, Grundflaeche 800 qm. '
+                 || 'Abstandsflaechen nach Landesbauordnung eingehalten. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Antragsteller: Max Mustermann, Musterstrasse 12, 12345 Beispielstadt.', 1),
+                ('baubeschreibung.pdf', 'Baubeschreibung', 'Baubeschreibung mit Angaben zu Konstruktion und Nutzung.',
+                 'Baubeschreibung. Zweigeschossiges Buerogebaeude in Holzhybridbauweise. '
+                 || 'Gebaeudehoehe 15 m, Grundflaeche 800 qm. '
+                 || 'Nutzflaeche 1.200 qm, Flachdach mit PV-Anlage (30 kWp). '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt. '
+                 || 'Stellplaetze: 24 PKW, davon 2 barrierefrei. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Bauherr: Erika Musterfrau, Beispielweg 7, 54321 Musterhausen.', 2))
+              insert into core.ist_dokumente (id, antrag_id, assoziierte_dokument_id, dateiname, titel, beschreibung, markdown_text, dokumenttyp, ist_von_ki_analysiert, erstellt_am)
+              select md5(f.id::text || '/ist-' || i.ord)::uuid, f.id,
+                     md5('spark-api-demo/doc/' || f.id::text || '/' || i.ord)::uuid,
+                     i.datei, i.titel, i.beschreibung, i.md, 'pdf', false, now()
+              from fixed f cross join ist i
+              on conflict (id) do nothing;
+
+              -- Content refresh for existing seed-owned rows (insert above
+              -- is ON CONFLICT DO NOTHING): update markdown_text when the
+              -- seed content changed, and reset the KI-analysis flag so
+              -- the next Vollstaendigkeitspruefung re-extracts.
+              with fixed(id) as (
+                select id from core.antraege where erstellt_von = 'demo-seed'
+              ), ist(datei, md, ord) as (values
+                ('lageplan.pdf',
+                 'Lageplan. Amtlicher Lageplan des Grundstuecks, Massstab 1:1000. '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt, Blatt 1-2. '
+                 || 'Grundstuecksflaeche: 2.400 qm, Baufenster 40 m x 20 m. '
+                 || 'Geplantes Gebaeude: zweigeschossiges Buerogebaeude, Gebaeudehoehe 12 m, Grundflaeche 800 qm. '
+                 || 'Abstandsflaechen nach Landesbauordnung eingehalten. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Antragsteller: Max Mustermann, Musterstrasse 12, 12345 Beispielstadt.', 1),
+                ('baubeschreibung.pdf',
+                 'Baubeschreibung. Zweigeschossiges Buerogebaeude in Holzhybridbauweise. '
+                 || 'Gebaeudehoehe 15 m, Grundflaeche 800 qm. '
+                 || 'Nutzflaeche 1.200 qm, Flachdach mit PV-Anlage (30 kWp). '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt. '
+                 || 'Stellplaetze: 24 PKW, davon 2 barrierefrei. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Bauherr: Erika Musterfrau, Beispielweg 7, 54321 Musterhausen.', 2))
+              update core.ist_dokumente d
+                 set markdown_text = i.md,
+                     ist_von_ki_analysiert = false
+                from fixed f cross join ist i
+               where d.id = md5(f.id::text || '/ist-' || i.ord)::uuid
+                 and d.markdown_text is distinct from i.md;
+
+              -- Mirror table dokumentenaufbereitung.dokumente: in a live
+              -- deployment the RabbitMQ fanout consumer fills it from the
+              -- processing pipeline; the periodic fact-extraction scheduler
+              -- reads ONLY this table (observed: Konsistenzpruefung ran
+              -- with fact_count=0 and failed — no facts are ever extracted
+              -- without rows here). Seed the same md5-derived document IDs
+              -- with the same fact-dense texts; content refresh included.
+              create schema if not exists dokumentenaufbereitung;
+              create table if not exists dokumentenaufbereitung.dokumente (
+                id uuid primary key,
+                proposal_id uuid not null,
+                filetype varchar(4) not null,
+                filename varchar(200) not null,
+                created_at timestamptz,
+                link_to_file varchar(500) not null,
+                user_id uuid not null,
+                document_text text,
+                document_type varchar(100) not null,
+                status varchar(50),
+                importiert_am timestamptz,
+                aktualisiert_am timestamptz,
+                geloescht_am timestamptz
+              );
+              with fixed(id) as (
+                select id from core.antraege where erstellt_von = 'demo-seed'
+              ), ist(datei, md, ord) as (values
+                ('lageplan.pdf',
+                 'Lageplan. Amtlicher Lageplan des Grundstuecks, Massstab 1:1000. '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt, Blatt 1-2. '
+                 || 'Grundstuecksflaeche: 2.400 qm, Baufenster 40 m x 20 m. '
+                 || 'Geplantes Gebaeude: zweigeschossiges Buerogebaeude, Gebaeudehoehe 12 m, Grundflaeche 800 qm. '
+                 || 'Abstandsflaechen nach Landesbauordnung eingehalten. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Antragsteller: Max Mustermann, Musterstrasse 12, 12345 Beispielstadt.', 1),
+                ('baubeschreibung.pdf',
+                 'Baubeschreibung. Zweigeschossiges Buerogebaeude in Holzhybridbauweise. '
+                 || 'Gebaeudehoehe 15 m, Grundflaeche 800 qm. '
+                 || 'Nutzflaeche 1.200 qm, Flachdach mit PV-Anlage (30 kWp). '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt. '
+                 || 'Stellplaetze: 24 PKW, davon 2 barrierefrei. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Bauherr: Erika Musterfrau, Beispielweg 7, 54321 Musterhausen.', 2))
+              insert into dokumentenaufbereitung.dokumente
+                (id, proposal_id, filetype, filename, created_at, link_to_file,
+                 user_id, document_text, document_type, status, importiert_am, aktualisiert_am)
+              select md5('spark-api-demo/doc/' || f.id::text || '/' || i.ord)::uuid,
+                     f.id, 'pdf', i.datei, now(),
+                     'https://example.invalid/docs/' || md5('spark-api-demo/doc/' || f.id::text || '/' || i.ord) || '.pdf',
+                     '60e43a62-8759-5fdf-b028-85a2b6d61bea'::uuid,
+                     i.md, 'report', 'completed', now(), now()
+              from fixed f cross join ist i
+              on conflict (id) do nothing;
+              with fixed(id) as (
+                select id from core.antraege where erstellt_von = 'demo-seed'
+              ), ist(datei, md, ord) as (values
+                ('lageplan.pdf',
+                 'Lageplan. Amtlicher Lageplan des Grundstuecks, Massstab 1:1000. '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt, Blatt 1-2. '
+                 || 'Grundstuecksflaeche: 2.400 qm, Baufenster 40 m x 20 m. '
+                 || 'Geplantes Gebaeude: zweigeschossiges Buerogebaeude, Gebaeudehoehe 12 m, Grundflaeche 800 qm. '
+                 || 'Abstandsflaechen nach Landesbauordnung eingehalten. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Antragsteller: Max Mustermann, Musterstrasse 12, 12345 Beispielstadt.', 1),
+                ('baubeschreibung.pdf',
+                 'Baubeschreibung. Zweigeschossiges Buerogebaeude in Holzhybridbauweise. '
+                 || 'Gebaeudehoehe 15 m, Grundflaeche 800 qm. '
+                 || 'Nutzflaeche 1.200 qm, Flachdach mit PV-Anlage (30 kWp). '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt. '
+                 || 'Stellplaetze: 24 PKW, davon 2 barrierefrei. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Bauherr: Erika Musterfrau, Beispielweg 7, 54321 Musterhausen.', 2))
+              update dokumentenaufbereitung.dokumente d
+                 set document_text = i.md,
+                     aktualisiert_am = now(),
+                     geloescht_am = null
+                from fixed f cross join ist i
+               where d.id = md5('spark-api-demo/doc/' || f.id::text || '/' || i.ord)::uuid
+                 and d.document_text is distinct from i.md;
+
+              -- Chunk mirror table: the fact extractor reads
+              -- dokumentenaufbereitung.dokumenten_chunks per document (the
+              -- RabbitMQ pipeline fills it in live deployments) — without
+              -- chunks it logs "Successfully extracted 0 facts" in ~30 ms
+              -- and never calls the LLM (observed). Seed one chunk per demo
+              -- document carrying the full fact-dense text; refresh on
+              -- content changes via deterministic chunk IDs.
+              create table if not exists dokumentenaufbereitung.dokumenten_chunks (
+                id uuid primary key,
+                doc_id uuid not null,
+                page_id uuid not null,
+                chunk_text text,
+                bbox_json json,
+                importiert_am timestamptz
+              );
+              with fixed(id) as (
+                select id from core.antraege where erstellt_von = 'demo-seed'
+              ), ist(md, ord) as (values
+                ('Lageplan. Amtlicher Lageplan des Grundstuecks, Massstab 1:1000. '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt, Blatt 1-2. '
+                 || 'Grundstuecksflaeche: 2.400 qm, Baufenster 40 m x 20 m. '
+                 || 'Geplantes Gebaeude: zweigeschossiges Buerogebaeude, Gebaeudehoehe 12 m, Grundflaeche 800 qm. '
+                 || 'Abstandsflaechen nach Landesbauordnung eingehalten. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Antragsteller: Max Mustermann, Musterstrasse 12, 12345 Beispielstadt.', 1),
+                ('Baubeschreibung. Zweigeschossiges Buerogebaeude in Holzhybridbauweise. '
+                 || 'Gebaeudehoehe 15 m, Grundflaeche 800 qm. '
+                 || 'Nutzflaeche 1.200 qm, Flachdach mit PV-Anlage (30 kWp). '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt. '
+                 || 'Stellplaetze: 24 PKW, davon 2 barrierefrei. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Bauherr: Erika Musterfrau, Beispielweg 7, 54321 Musterhausen.', 2))
+              insert into dokumentenaufbereitung.dokumenten_chunks
+                (id, doc_id, page_id, chunk_text, bbox_json, importiert_am)
+              select md5('spark-api-demo/chunk/' || f.id::text || '/' || i.ord)::uuid,
+                     md5('spark-api-demo/doc/' || f.id::text || '/' || i.ord)::uuid,
+                     md5('spark-api-demo/page/' || f.id::text || '/' || i.ord)::uuid,
+                     i.md, '{}'::json, now()
+              from fixed f cross join ist i
+              on conflict (id) do nothing;
+              with fixed(id) as (
+                select id from core.antraege where erstellt_von = 'demo-seed'
+              ), ist(md, ord) as (values
+                ('Lageplan. Amtlicher Lageplan des Grundstuecks, Massstab 1:1000. '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt, Blatt 1-2. '
+                 || 'Grundstuecksflaeche: 2.400 qm, Baufenster 40 m x 20 m. '
+                 || 'Geplantes Gebaeude: zweigeschossiges Buerogebaeude, Gebaeudehoehe 12 m, Grundflaeche 800 qm. '
+                 || 'Abstandsflaechen nach Landesbauordnung eingehalten. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Antragsteller: Max Mustermann, Musterstrasse 12, 12345 Beispielstadt.', 1),
+                ('Baubeschreibung. Zweigeschossiges Buerogebaeude in Holzhybridbauweise. '
+                 || 'Gebaeudehoehe 15 m, Grundflaeche 800 qm. '
+                 || 'Nutzflaeche 1.200 qm, Flachdach mit PV-Anlage (30 kWp). '
+                 || 'Flurstueck 123/4, Gemarkung Beispielstadt. '
+                 || 'Stellplaetze: 24 PKW, davon 2 barrierefrei. '
+                 || 'Erschliessung ueber die Musterstrasse (Nordseite). '
+                 || 'Bauherr: Erika Musterfrau, Beispielweg 7, 54321 Musterhausen.', 2))
+              update dokumentenaufbereitung.dokumenten_chunks c
+                 set chunk_text = i.md,
+                     importiert_am = now()
+                from fixed f cross join ist i
+               where c.id = md5('spark-api-demo/chunk/' || f.id::text || '/' || i.ord)::uuid
+                 and c.chunk_text is distinct from i.md;
+              -- Repair pass for rows seeded with a list value before the
+              -- dict_type fix (the chunk domain model validates bbox_json
+              -- as dict; observed: pydantic dict_type error aborting fact
+              -- extraction for every seeded chunk).
+              update dokumentenaufbereitung.dokumenten_chunks
+                 set bbox_json = '{}'::json
+               where bbox_json::text = '[]';
+
+              -- Unstick fact extraction for seed documents: the upstream
+              -- DELETE /faktenextraktion/ API soft-deletes the FACTS but its
+              -- run cleanup is ineffective, and the periodic scheduler
+              -- treats any document with a live ABGESCHLOSSEN run as
+              -- processed forever — facts can then never be re-extracted
+              -- through the API (observed: "Found 32 existing processed
+              -- documents … 0 documents have not been processed yet" while
+              -- zero active facts existed; upstream-issue candidate).
+              -- Soft-delete runs of seed documents that have no active
+              -- facts so the next scheduler tick re-extracts them.
+              do $do$
+              begin
+                if to_regclass('koharaenzpruefung.faktenextraktion') is not null then
+                  update koharaenzpruefung.faktenextraktion fe
+                     set deleted_at = now()
+                   where fe.deleted_at is null
+                     and fe.dokument_id in (
+                       select md5('spark-api-demo/doc/' || a.id::text || '/' || n.n)::uuid
+                         from core.antraege a
+                        cross join (values (1),(2)) as n(n)
+                        where a.erstellt_von = 'demo-seed')
+                     and not exists (
+                       select 1 from koharaenzpruefung.fakten f
+                        where f.dokument_id = fe.dokument_id
+                          and f.deleted_at is null);
+                end if;
+              end
+              $do$;
+              SQL
+              echo "dokumentenpruefung seed done"
+{{- end }}

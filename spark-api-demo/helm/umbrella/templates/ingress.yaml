@@ -1,0 +1,93 @@
+# Consolidated edge: one host, path routing.
+#   /                     -> frontend (no rewrite)
+#   /api/<service>/...    -> service (prefix stripped via regex rewrite)
+# TLS via cert-manager ingress-shim (cluster issuer annotation).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spark-api
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.ingress.maxBodySize | quote }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    {{- if .Values.auth.enabled }}
+    # OIDC perimeter: every request is checked against oauth2-proxy
+    # (in-cluster URL — the controller must not hairpin through the NLB),
+    # browsers get redirected into the login flow on the same host.
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy.{{ .Values.auth.platformNamespace }}.svc.cluster.local:4180/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://$host/oauth2/start?rd=$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-User, X-Auth-Request-Email
+    {{- end }}
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: spark-api-tls
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- range $name, $svc := .Values.services }}
+          {{- if $svc.enabled }}
+          - path: /api/{{ $name }}(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ $name }}
+                port: { name: http }
+          {{- end }}
+          {{- end }}
+---
+# Frontend on / without rewrite (assets are served from the web root).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spark-api-frontend
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+    {{- if .Values.auth.enabled }}
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy.{{ .Values.auth.platformNamespace }}.svc.cluster.local:4180/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://$host/oauth2/start?rd=$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-User, X-Auth-Request-Email
+    {{- end }}
+    {{- if .Values.inspector.enabled }}
+    # Demo-inspector injection at the EDGE: the upstream frontend image
+    # stays byte-identical; nginx rewrites </head> in the served HTML.
+    # Accept-Encoding is stripped so sub_filter sees uncompressed bodies
+    # (html only — sub_filter defaults to text/html). Requires
+    # allowSnippetAnnotations + annotations-risk-level Critical on the
+    # controller (set in k8s-addons).
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Accept-Encoding "";
+      sub_filter '</head>' '<script defer src="/demo-inspector/inspector.js"></script></head>';
+      sub_filter_once on;
+    {{- end }}
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: spark-api-tls
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- if .Values.inspector.enabled }}
+          - path: /demo-inspector
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-inspector
+                port: { name: http }
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port: { name: http }

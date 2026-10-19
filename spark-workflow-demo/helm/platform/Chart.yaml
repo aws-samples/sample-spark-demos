@@ -1,0 +1,11 @@
+apiVersion: v2
+name: spark-platform
+description: >
+  Platform layer for the SPARK Workflow demo on AWS EKS: Keycloak (+realm
+  bootstrap), oauth2-proxy, LiteLLM gateway (Amazon Bedrock backend), TEI
+  embeddings (BGE-M3), database init job against RDS, ExternalSecrets and
+  Gateway API routes. Self-contained templates, no external chart
+  dependencies. Demo-grade, MIT-0.
+type: application
+version: 0.2.0
+appVersion: "0.1.6"

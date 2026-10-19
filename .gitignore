@@ -1,0 +1,47 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.auto.tfvars.example
+!examples/**/*.tfvars
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl.bak
+tfplan
+*.tfplan
+
+# Helm
+**/charts/*.tgz
+**/Chart.lock.bak
+
+# Staged chart copies for helm dependency update (submodules stay clean)
+**/.build/
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+kubeconfig*
+!kubeconfig.example
+
+# Build artifacts
+dist/
+build/
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# Python
+__pycache__/
+*.pyc

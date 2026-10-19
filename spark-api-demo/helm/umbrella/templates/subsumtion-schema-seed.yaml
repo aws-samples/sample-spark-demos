@@ -1,0 +1,78 @@
+{{- $svc := index .Values.services "subsumtion-service" }}
+{{- if $svc.enabled }}
+# The subsumtion-service bootstrap is broken on a FRESH database upstream:
+# the alembic initial revision (42828adac28d) is a no-op, the service ships
+# no create_all, and the very next migration runs
+# `ALTER TYPE approvalstate ADD VALUE ...` (observed: crashloop
+# "UndefinedObjectError: type approvalstate does not exist" at startup).
+# Upstream dev databases evolved through older code states; a clean install
+# never gets the schema (upstream-issue candidate).
+#
+# This hook job creates the current-model schema via SQLModel
+# metadata.create_all (idempotent, checkfirst) and then stamps the alembic
+# version table to head so the in-service `upgrade(head)` at startup does
+# not re-apply migrations against tables that already match the models
+# (add_column migrations would fail with duplicate columns otherwise).
+# Same image + env as the service; safe to re-run on every upgrade.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: subsumtion-schema-seed
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "4"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {{- include "spark-api.selectorLabels" "subsumtion-schema-seed" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: "{{ .Values.global.registry }}/{{ .Values.global.repositoryPrefix }}/subsumtion-service:{{ $svc.tag | default .Values.global.tag }}"
+          workingDir: /app
+          command:
+            - /app/.venv/bin/python
+            - -c
+            - |
+              import asyncio
+              from sqlmodel import SQLModel
+              from subsumtion.data.postgres_db.db import PostgresDB  # imports schema module
+
+              db = PostgresDB()
+
+              async def create_all() -> None:
+                  async with db.engine.begin() as conn:
+                      await conn.run_sync(SQLModel.metadata.create_all)
+
+              asyncio.run(create_all())
+
+              from alembic import command
+              from alembic.config import Config
+
+              command.stamp(Config("/app/alembic.ini"), "head")
+              print("subsumtion schema created + alembic stamped to head")
+          env:
+            {{- range $key, $spec := $svc.env }}
+            - name: {{ $key }}
+              {{- if kindIs "map" $spec }}
+              {{- if $spec.secret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $spec.secret.name }}
+                  key: {{ $spec.secret.key }}
+              {{- else if $spec.fieldRef }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: {{ $spec.fieldRef }}
+              {{- end }}
+              {{- else }}
+              value: {{ $spec | quote }}
+              {{- end }}
+            {{- end }}
+{{- end }}

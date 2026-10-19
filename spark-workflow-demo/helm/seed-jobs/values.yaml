@@ -1,0 +1,28 @@
+# Values are populated by the terraform app-workflow module (helm_release).
+
+# Master switch: render nothing when disabled (the release stays empty).
+enabled: true
+
+# Helm release name of the upstream umbrella (prefixes the deployment names).
+appReleaseName: spark
+
+# Services whose images ship src/scripts/seed_data.py (see upstream
+# process-compose.yaml: *-seed processes).
+seedServices:
+  - project-logic-service
+  - formal-completeness-check
+  - administrative-file-draft
+
+# How long to wait for each service rollout before seeding (fresh installs
+# pull images and run migrations first).
+rolloutTimeoutSeconds: 900
+
+# kubectl image for the runner job. Needs kubectl AND a shell: the official
+# registry.k8s.io/kubectl image is distroless (verified: StartError, no
+# /bin/sh) and bitnami/eks-distro kubectl repos do not exist on
+# public.ecr.aws — alpine/k8s ships kubectl + bash (verified in-cluster).
+kubectlImage: docker.io/alpine/k8s:1.33.4
+
+# Opaque change trigger: the terraform module passes a hash of the rendered
+# umbrella values so every umbrella change re-runs the (idempotent) seeds.
+runTrigger: ""

@@ -1,0 +1,94 @@
+# LiteLLM gateway — the upstream-mandated "LLM-Proxy" component.
+# Backend: Amazon Bedrock (open-weights gpt-oss-120b) via EKS Pod Identity,
+# embeddings via the in-cluster TEI deployment (BGE-M3).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.litellm.serviceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    model_list:
+      - model_name: {{ .Values.litellm.chatModelName }}
+        litellm_params:
+          model: bedrock/{{ .Values.litellm.bedrockModelId }}
+          aws_region_name: {{ .Values.litellm.bedrockRegion }}
+      # Vision model (VLM enhancement stage) — image-capable, via the EU
+      # cross-region inference profile.
+      - model_name: {{ .Values.litellm.vlmModelName }}
+        litellm_params:
+          model: bedrock/{{ .Values.litellm.bedrockVlmModelId }}
+          aws_region_name: {{ .Values.litellm.bedrockRegion }}
+      {{- if .Values.tei.enabled }}
+      - model_name: {{ .Values.litellm.embeddingModelName }}
+        litellm_params:
+          model: openai/{{ .Values.tei.modelId }}
+          api_base: http://tei.{{ .Release.Namespace }}.svc.cluster.local:8080/v1
+          api_key: "none"
+      {{- end }}
+    litellm_settings:
+      drop_params: true
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-platform.selectorLabels" "litellm" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-platform.selectorLabels" "litellm" | nindent 8 }}
+      annotations:
+        checksum/config: {{ print (toYaml .Values.litellm) (toYaml .Values.tei) | sha256sum | trunc 32 }}
+    spec:
+      serviceAccountName: {{ .Values.litellm.serviceAccountName }}
+      containers:
+        - name: litellm
+          image: {{ .Values.litellm.image }}
+          args: ["--config", "/config/config.yaml", "--port", "4000"]
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: litellm, key: master_key } }
+            - name: AWS_REGION
+              value: {{ .Values.litellm.bedrockRegion }}
+          ports:
+            - { name: http, containerPort: 4000 }
+          readinessProbe:
+            httpGet: { path: /health/readiness, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health/liveliness, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          volumeMounts:
+            - { name: config, mountPath: /config }
+          resources: {{- toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap: { name: litellm-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-platform.selectorLabels" "litellm" | nindent 4 }}
+  ports:
+    - { name: http, port: 4000, targetPort: http }

@@ -1,0 +1,109 @@
+{{- if .Values.enabled }}
+# Post-install/upgrade hook: wait for each seed-capable service rollout,
+# then execute the upstream seed script inside the running pod. The seeds
+# are idempotent (row_exists checks upstream), so re-running is safe.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-seed-runner
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spark-seed-runner
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-seed-runner
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spark-seed-runner
+subjects:
+  - kind: ServiceAccount
+    name: spark-seed-runner
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-seed-runner
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  run-seeds.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    NS="{{ .Release.Namespace }}"
+    RELEASE="{{ .Values.appReleaseName }}"
+    TIMEOUT="{{ .Values.rolloutTimeoutSeconds }}"
+    SERVICES="{{ join " " .Values.seedServices }}"
+
+    for svc in $SERVICES; do
+      deploy="$RELEASE-$svc"
+      echo "==> waiting for rollout of deploy/$deploy (max ${TIMEOUT}s)"
+      kubectl -n "$NS" rollout status "deploy/$deploy" --timeout="${TIMEOUT}s"
+      echo "==> seeding $svc (python -m src.scripts.seed_data)"
+      kubectl -n "$NS" exec "deploy/$deploy" -- python -m src.scripts.seed_data
+      echo "==> $svc seeded"
+    done
+    echo "All seeds completed."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-seed-runner
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation
+  labels:
+    # Opaque trigger: changes whenever the umbrella values change.
+    spark-demo.config/run-trigger: {{ .Values.runTrigger | default "static" | quote }}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 2700
+  template:
+    spec:
+      serviceAccountName: spark-seed-runner
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: {{ .Values.kubectlImage }}
+          command: ["/bin/bash", "/scripts/run-seeds.sh"]
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: spark-seed-runner, defaultMode: 0755 }
+{{- end }}

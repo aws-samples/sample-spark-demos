@@ -1,0 +1,14 @@
+apiVersion: v2
+name: spark-seed-jobs
+description: >
+  Runs the upstream lookup-data seeds (python -m src.scripts.seed_data) for
+  the SPARK Workflow services that ship one (project-logic-service,
+  formal-completeness-check, administrative-file-draft). Upstream only wires
+  these seeds in its local process-compose setup; the Helm charts do not
+  include them, so a fresh deployment starts without procedure types etc.
+  The runner waits for each service rollout and executes the (idempotent)
+  seed inside the running service pod — same image, same env, no wiring
+  duplicated. Demo-grade, MIT-0.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

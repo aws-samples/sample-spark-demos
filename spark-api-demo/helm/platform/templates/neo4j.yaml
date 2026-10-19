@@ -1,0 +1,69 @@
+# Neo4j Community Edition (graph-api, norm-matching). No OSS-based managed
+# Neo4j exists on AWS; Neptune is API-incompatible (upstream uses Bolt).
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-api-platform.selectorLabels" "neo4j" | nindent 4 }}
+  ports:
+    - { name: bolt, port: 7687, targetPort: bolt }
+    - { name: http, port: 7474, targetPort: http }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  serviceName: neo4j
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-api-platform.selectorLabels" "neo4j" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "neo4j" | nindent 8 }}
+    spec:
+      # Kubernetes service links inject NEO4J_PORT_7687_TCP_PORT etc. (the
+      # service is named neo4j), and the image treats every NEO4J_* env var
+      # as a config setting -> strict validation crash (observed:
+      # "Unrecognized setting ... PORT.7687.TCP.PORT").
+      enableServiceLinks: false
+      {{- if .Values.statefulPool }}
+      {{- include "spark-api-platform.statefulPlacement" . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: neo4j
+          image: {{ .Values.neo4j.image }}
+          env:
+            # Helper vars deliberately do NOT start with NEO4J_ — the image
+            # parses every NEO4J_* env var as a config setting (observed:
+            # "Unrecognized setting ... AUTH.PASSWORD").
+            - name: AUTH_USER
+              valueFrom: { secretKeyRef: { name: neo4j, key: username } }
+            - name: AUTH_PASS
+              valueFrom: { secretKeyRef: { name: neo4j, key: password } }
+            # NEO4J_AUTH format: user/password
+            - name: NEO4J_AUTH
+              value: "$(AUTH_USER)/$(AUTH_PASS)"
+          ports:
+            - { name: bolt, containerPort: 7687 }
+            - { name: http, containerPort: 7474 }
+          readinessProbe:
+            tcpSocket: { port: bolt }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources: {{- toYaml .Values.neo4j.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.neo4j.storage }}

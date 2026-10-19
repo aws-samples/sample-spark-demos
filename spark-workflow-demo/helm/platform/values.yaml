@@ -1,0 +1,195 @@
+# Values are populated by the terraform app-deploy module (helm_release).
+# Placeholders here document the contract; never put real credentials in git.
+
+# Namespace the SPARK Workflow application umbrella is installed into
+# (HTTPRoute backends, ReferenceGrant, app-namespace ExternalSecrets).
+appNamespace: spark
+
+# Helm release name of the upstream umbrella (prefixes all app service names).
+appReleaseName: spark
+
+# Service port of the upstream frontend chart.
+frontendServicePort: 80
+
+# Perimeter login: Envoy Gateway native OIDC SecurityPolicy (primary).
+oidcPolicy:
+  enabled: true
+
+# API path routing on the frontend host, derived from the upstream frontend
+# contract (src/integrations/api-clients/configureClients.ts + vite proxy).
+# prefix   = client base path appended to VITE_API_BASE_URL (/api)
+# rewrite  = path prefix the backend expects ("/" strips everything)
+# service  = chart name in the app umbrella ({appReleaseName}-<service>)
+# port     = Service port (all upstream service charts expose 80)
+apiRoutes:
+  - { prefix: /pls/v1, service: project-logic-service }
+  - { prefix: /dms/v1, service: document-management-service }
+  - { prefix: /fcs/v1, service: formal-completeness-check }
+  - { prefix: /agent-orchestration/v1, service: agent-orchestration-service }
+  - { prefix: /temporal, service: temporal-job-service, rewrite: /temporal }
+  - { prefix: /plausibility-notes/v1, service: plausibility-notes }
+  - { prefix: /oms/v1, service: objections-management-service }
+  - { prefix: /supplementary-requests/v1, service: supplementary-requests-service }
+  - { prefix: /comment/v1, service: comment-service }
+  - { prefix: /examination/v1, service: examination-service }
+  - { prefix: /vae/v1, service: administrative-file-draft }
+  - { prefix: /law-changes/v1, service: rechtsaenderungs-monitoring }
+  - { prefix: /identity, service: identity-management-service }
+  - { prefix: /feedback/v1, service: feedback-service }
+  - { prefix: /protocol/v1, service: protocol-service }
+
+# ESO ClusterSecretStore created by the k8s-addons module.
+clusterSecretStore: aws-secrets-manager
+
+# AWS Secrets Manager entry names (outputs of the terraform secrets module).
+secretsManager:
+  rdsMaster: ""
+  rdsApp: ""
+  rdsTemporal: ""
+  rdsKeycloak: ""
+  rdsSpicedb: ""
+  s3App: ""
+  keycloak: ""
+  oauth2Proxy: ""
+  spicedb: ""
+  litellm: ""
+  # checkov:skip=CKV_SECRET_6: Secrets Manager entry NAME placeholder, filled by terraform
+  valkey: ""
+
+hosts:
+  frontend: "" # workflow.example.com
+  keycloak: "" # auth-workflow.example.com
+  temporal: "" # temporal-workflow.example.com
+
+gateway:
+  name: spark-demo
+  namespace: spark-platform
+
+rds:
+  host: ""
+  port: 5432
+
+s3:
+  endpointUrl: ""
+  region: ""
+  dmsBucket: ""
+  # Seed object uploaded by terraform (bootstrap/gesetze-normen-seed.sql.gz)
+  seedObjectKey: "bootstrap/gesetze-normen-seed.sql.gz"
+
+dbInit:
+  enabled: true
+  image: public.ecr.aws/docker/library/postgres:16
+  awsCliImage: public.ecr.aws/aws-cli/aws-cli:latest
+  # Database names follow the upstream umbrella DB_NAME defaults (these are
+  # what the deployed services connect to; the docker-compose list differs
+  # in places and is NOT authoritative for the Helm deployment).
+  databases:
+    - temporal
+    - spicedb
+    - keycloak
+    - project_logic_service
+    - temporal_job_service
+    - document_management_service
+    - administrative_file_draft
+    - comment_service
+    - examination_service
+    - feedback_service
+    - formal_completeness_check
+    - fpp_service
+    - identity_management_service
+    - objections_management_service
+    - plausibility_notes
+    - supplementary_requests_service
+    - gesetze_normen
+    - jura
+    - gesetzesbegruendung
+    - rechtsaenderungs_monitoring
+  # pgvector is enabled on all application databases (harmless where unused).
+  vectorDatabases:
+    - project_logic_service
+    - temporal_job_service
+    - document_management_service
+    - administrative_file_draft
+    - comment_service
+    - examination_service
+    - feedback_service
+    - formal_completeness_check
+    - fpp_service
+    - identity_management_service
+    - objections_management_service
+    - plausibility_notes
+    - supplementary_requests_service
+    - gesetze_normen
+    - jura
+    - gesetzesbegruendung
+    - rechtsaenderungs_monitoring
+  # Seed target for the upstream gesetze-normen SQL dump.
+  seedDatabase: gesetze_normen
+
+keycloak:
+  image: quay.io/keycloak/keycloak:26.0
+  realm: local
+  clientId: local-client
+  demoUser:
+    id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    firstName: "Spark"
+    lastName: "Demo"
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "2", memory: 2Gi }
+
+oauth2Proxy:
+  # Fallback perimeter auth (disabled: Envoy Gateway OIDC is primary).
+  enabled: false
+  image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
+  # Frontend service of the upstream umbrella ({release}-frontend.<appNamespace>).
+  upstreamService: spark-frontend
+  upstreamPort: 80
+
+litellm:
+  image: ghcr.io/berriai/litellm:main-stable
+  serviceAccountName: litellm # pod identity association (bedrock access)
+  bedrockRegion: eu-central-1
+  bedrockModelId: openai.gpt-oss-120b-1:0
+  # Vision model for the VLM enhancement stage (image input). The upstream
+  # default VLLM_MODEL (gpt-oss-120b) is text-only — Bedrock rejects image
+  # content blocks — so the workflow overlay points VLLM_MODEL at this name.
+  # eu.* inference profile: cross-region routing stays inside the EU.
+  vlmModelName: self-hosted/pixtral-large
+  bedrockVlmModelId: eu.mistral.pixtral-large-2502-v1:0
+  # Model names exposed to the application — EXACTLY the identifiers the
+  # upstream umbrella defaults reference, so no per-module overrides needed
+  # (sole exception: VLLM_MODEL → vlmModelName, see above).
+  chatModelName: self-hosted/gpt-oss-120b
+  embeddingModelName: self-hosted/bge-m3
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+tei:
+  enabled: true
+  image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+  modelId: BAAI/bge-m3
+  # Commit of BAAI/bge-m3 on the Hugging Face Hub (model repo HEAD, 2024-07-03).
+  revision: 5617a9f61b028005a4858fdac845db406aefb181
+  # BGE-M3 ONNX warmup peaks well above the model size (verified OOMs on
+  # first deploy with defaults) — cap batch tokens and give headroom.
+  maxBatchTokens: 4096
+  resources:
+    requests: { cpu: "2", memory: 6Gi }
+    limits: { cpu: "4", memory: 16Gi }
+
+temporalUi:
+  enabled: true
+  # Service name of the Temporal web UI in the app namespace ({release}-temporal-web).
+  serviceName: spark-temporal-web
+  servicePort: 8080
+
+# Additional ExternalSecrets rendered into the app namespace. Filled by the
+# umbrella wiring (maps upstream-expected secret names to Secrets Manager
+# entries). Example:
+#   - name: project-logic-db-user
+#     data:
+#       - secretKey: username
+#         remoteRef: { key: <asm-name>, property: username }
+appSecrets: []

@@ -1,0 +1,135 @@
+# LiteLLM gateway — the upstream-mandated "LLM-Proxy" component.
+# Backend: Amazon Bedrock (open-weights gpt-oss-120b) via EKS Pod Identity,
+# embeddings via the in-cluster TEI deployment (BGE-M3).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.litellm.serviceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    model_list:
+      - model_name: {{ .Values.litellm.chatModelName }}
+        litellm_params:
+          model: bedrock/{{ .Values.litellm.bedrockModelId }}
+          aws_region_name: {{ .Values.litellm.bedrockRegion }}
+      # Alias for the anonymization placeholder shipped in the upstream
+      # prompt registries: dokumentenpruefung's prompt YAMLs carry
+      # model: "<LLM_MODEL>" and the code OVERWRITES the client's
+      # configured model with that value per call (ist_liste_extraktion
+      # et al.), so LLM_DEFAULT_MODEL alone cannot fix the check flows
+      # (observed: Vollstaendigkeitspruefung FEHLER with LiteLLM 400
+      # "Invalid model name passed in model=<LLM_MODEL>"). Serving the
+      # placeholder as a real alias keeps the submodule untouched.
+      # Backed by a Mistral model (see values.placeholderModelId) — the
+      # check pipelines use the Mistral SDK's structured output, which
+      # gpt-oss serves unreliably. Upstream-issue candidate.
+      - model_name: "<LLM_MODEL>"
+        litellm_params:
+          # Explicit converse route: for model IDs missing from LiteLLM's
+          # registry it defaults to the invoke route, and only converse
+          # translates response_format=json_schema into a forced tool call
+          # (observed: schema silently dropped, Pixtral answered free-form).
+          model: bedrock/converse/{{ .Values.litellm.placeholderModelId }}
+          aws_region_name: {{ .Values.litellm.bedrockRegion }}
+          # The Mistral SDK sends no max_tokens and Anthropic requires one,
+          # so LiteLLM's small default truncated long structured outputs
+          # mid-JSON (observed: Plausibilitaetspruefung got a single-field
+          # object with the whole document text inside "titel" — pydantic
+          # "missing" errors for the remaining required fields).
+          max_tokens: 8192
+        # The Mistral SDK's chat.parse sends response_format=json_schema and
+        # json-decodes the content verbatim. Without this capability flag
+        # LiteLLM's drop_params discards response_format for Bedrock and the
+        # model answers free-form (observed: Pixtral wrapped the JSON in
+        # markdown fences -> JSONDecodeError char 0 in the VP pipeline).
+        # With the flag LiteLLM enforces the schema via Converse tool-calling.
+        model_info:
+          supports_response_schema: true
+      {{- if .Values.tei.enabled }}
+      - model_name: {{ .Values.litellm.embeddingModelName }}
+        litellm_params:
+          model: openai/{{ .Values.tei.modelId }}
+          api_base: http://tei.{{ .Release.Namespace }}.svc.cluster.local:8080/v1
+          api_key: "none"
+      {{- end }}
+    litellm_settings:
+      drop_params: true
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-api-platform.selectorLabels" "litellm" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "litellm" | nindent 8 }}
+      annotations:
+        # config-rev bumps on template-level config changes (values alone
+        # do not capture them; observed: alias added, checksum unchanged,
+        # pod kept serving the old model list).
+        checksum/config: {{ print (toYaml .Values.litellm) (toYaml .Values.tei) "config-rev-9" | sha256sum | trunc 32 }}
+    spec:
+      serviceAccountName: {{ .Values.litellm.serviceAccountName }}
+      containers:
+        - name: litellm
+          image: {{ .Values.litellm.image }}
+          args: ["--config", "/config/config.yaml", "--port", "4000"]
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: litellm, key: master_key } }
+            - name: AWS_REGION
+              value: {{ .Values.litellm.bedrockRegion }}
+            # Request-log persistence: /spend/logs (consumed by the demo
+            # inspector) requires the proxy database (observed: 500 without
+            # one). db-init creates the `litellm` DB; password is
+            # alphanumeric (terraform random_password special=false), so
+            # plain URL composition is safe.
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: rds-app, key: username } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: rds-app, key: password } }
+            - name: DATABASE_URL
+              value: postgresql://$(DB_USER):$(DB_PASSWORD)@{{ .Values.rds.host }}:{{ .Values.rds.port }}/litellm
+          ports:
+            - { name: http, containerPort: 4000 }
+          readinessProbe:
+            httpGet: { path: /health/readiness, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health/liveliness, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          volumeMounts:
+            - { name: config, mountPath: /config }
+          resources: {{- toYaml .Values.litellm.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap: { name: litellm-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-api-platform.selectorLabels" "litellm" | nindent 4 }}
+  ports:
+    - { name: http, port: 4000, targetPort: http }

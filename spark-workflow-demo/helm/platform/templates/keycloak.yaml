@@ -1,0 +1,73 @@
+# Keycloak, demo-grade single replica. Mirrors the upstream compose semantics
+# (Keycloak 26, token-exchange feature, xforwarded proxy headers) but persists
+# to RDS instead of dev-file and terminates TLS at the Envoy Gateway.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-platform.selectorLabels" "keycloak" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-platform.selectorLabels" "keycloak" | nindent 8 }}
+    spec:
+      containers:
+        - name: keycloak
+          image: {{ .Values.keycloak.image }}
+          args:
+            - start
+            - --http-enabled=true
+            - --http-port=8080
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://{{ .Values.rds.host }}:{{ .Values.rds.port }}/keycloak
+            - name: KC_DB_USERNAME
+              valueFrom: { secretKeyRef: { name: keycloak-db, key: username } }
+            - name: KC_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: keycloak-db, key: password } }
+            - name: KC_HOSTNAME
+              value: https://{{ .Values.hosts.keycloak }}
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: keycloak-credentials, key: admin_password } }
+            - name: KC_FEATURES
+              value: token-exchange
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_HTTP_MANAGEMENT_PORT
+              value: "9000"
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: management, containerPort: 9000 }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: management }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /health/live, port: management }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          resources: {{- toYaml .Values.keycloak.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-platform.selectorLabels" "keycloak" | nindent 4 }}
+  ports:
+    - { name: http, port: 8080, targetPort: http }

@@ -1,0 +1,6 @@
+[submodule "spark-api-demo/spark-api"]
+	path = spark-api-demo/spark-api
+	url = https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-api.git
+[submodule "spark-workflow-demo/spark-workflow"]
+	path = spark-workflow-demo/spark-workflow
+	url = https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow.git

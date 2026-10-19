@@ -1,0 +1,40 @@
+# Builds ONE Python service image from the source zip (ADR 0001 vendor
+# context). Parameterized via batch env: IMAGE_NAME, SERVICE_PATH.
+# Project env: ECR_REGISTRY, ECR_PREFIX.
+version: 0.2
+env:
+  variables:
+    UV_VERSION: "0.9.6"
+phases:
+  install:
+    commands:
+      # uv performs the workspace lock in prepare-context.sh (upstream ships
+      # no uv.lock). Pinned for reproducibility.
+      - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+      - export PATH="$HOME/.local/bin:$PATH"
+      - uv --version
+  pre_build:
+    commands:
+      - export GIT_SHA=$(cat SOURCE_VERSION 2>/dev/null || echo unknown)
+      - echo "Building ${IMAGE_NAME} from ${SERVICE_PATH} at ${GIT_SHA}"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+  build:
+    commands:
+      # Tags are content-addressed (source sha + pipeline hash) and the
+      # repositories are IMMUTABLE: an existing tag means this exact input
+      # was already built, so a batch retry or a --force run skips it
+      # instead of failing on the re-push. A new build needs a new tag
+      # (change a pipeline input) — never delete and re-push a tag.
+      - |
+        if aws ecr describe-images --repository-name "$ECR_PREFIX/$IMAGE_NAME" --image-ids imageTag="$GIT_SHA" > /dev/null 2>&1; then
+          echo "Image $ECR_PREFIX/$IMAGE_NAME:$GIT_SHA already exists (immutable, content-addressed) — skipping build"
+        else
+          # 1. Deterministic CI workspace: vendor path deps, strip dev group,
+          #    generate uv.lock, replace base-image placeholders.
+          bash pipeline/prepare-context.sh . "$SERVICE_PATH" /tmp/ctx
+          # 2. Build (BuildKit for the cache/bind mounts upstream uses) and push
+          #    the content tag only — no floating :latest.
+          export DOCKER_BUILDKIT=1
+          docker build -t "$ECR_REGISTRY/$ECR_PREFIX/$IMAGE_NAME:$GIT_SHA" /tmp/ctx
+          docker push "$ECR_REGISTRY/$ECR_PREFIX/$IMAGE_NAME:$GIT_SHA"
+        fi

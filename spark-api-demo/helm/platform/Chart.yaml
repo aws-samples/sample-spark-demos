@@ -1,0 +1,11 @@
+apiVersion: v2
+name: spark-api-platform
+description: >
+  Platform layer for the SPARK API demo on AWS EKS: RabbitMQ, Neo4j
+  Community, Qdrant, LiteLLM gateway (Amazon Bedrock backend), TEI
+  embeddings (BGE-M3), database init job against RDS, and ExternalSecrets.
+  Self-contained templates, no external chart dependencies. Demo-grade,
+  MIT-0.
+type: application
+version: 0.2.0
+appVersion: "0.1.3"

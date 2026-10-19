@@ -1,0 +1,52 @@
+# Qdrant vector database (dokumentensuche, fristenmanagement).
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-api-platform.selectorLabels" "qdrant" | nindent 4 }}
+  ports:
+    - { name: http, port: 6333, targetPort: http }
+    - { name: grpc, port: 6334, targetPort: grpc }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  serviceName: qdrant
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-api-platform.selectorLabels" "qdrant" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "qdrant" | nindent 8 }}
+    spec:
+      {{- if .Values.statefulPool }}
+      {{- include "spark-api-platform.statefulPlacement" . | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: qdrant
+          image: {{ .Values.qdrant.image }}
+          ports:
+            - { name: http, containerPort: 6333 }
+            - { name: grpc, containerPort: 6334 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - { name: data, mountPath: /qdrant/storage }
+          resources: {{- toYaml .Values.qdrant.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.qdrant.storage }}

@@ -1,0 +1,78 @@
+# One generic Deployment + Service per entry in .Values.services.
+# env entries support three forms:
+#   value:  literal string
+#   secret: { name, key }   -> secretKeyRef
+#   fieldRef: <path>        -> downward API (e.g. status.hostIP)
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "spark-api.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ $svc.replicas | default 1 }}
+  selector:
+    matchLabels: {{- include "spark-api.selectorLabels" $name | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api.selectorLabels" $name | nindent 8 }}
+      annotations:
+        checksum/wiring: {{ toYaml $svc | sha256sum | trunc 32 }}
+    spec:
+      containers:
+        - name: {{ $name }}
+          image: "{{ $.Values.global.registry }}/{{ $.Values.global.repositoryPrefix }}/{{ $svc.image | default $name }}:{{ $svc.tag | default $.Values.global.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ $svc.port | default 8000 }}
+          env:
+            {{- range $key, $spec := $svc.env }}
+            - name: {{ $key }}
+              {{- if kindIs "map" $spec }}
+              {{- if $spec.secret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $spec.secret.name }}
+                  key: {{ $spec.secret.key }}
+              {{- else if $spec.fieldRef }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: {{ $spec.fieldRef }}
+              {{- end }}
+              {{- else }}
+              value: {{ $spec | quote }}
+              {{- end }}
+            {{- end }}
+          {{- if not $svc.disableProbes }}
+          readinessProbe:
+            httpGet:
+              path: {{ $svc.healthPath | default "/health" }}
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 10
+          {{- end }}
+          resources:
+            {{- toYaml ($svc.resources | default $.Values.global.defaultResources) | nindent 12 }}
+      {{- if $svc.serviceAccountName }}
+      serviceAccountName: {{ $svc.serviceAccountName }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "spark-api.labels" $ | nindent 4 }}
+spec:
+  selector: {{- include "spark-api.selectorLabels" $name | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}
+{{- end }}

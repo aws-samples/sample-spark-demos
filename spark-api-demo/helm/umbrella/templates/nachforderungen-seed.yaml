@@ -1,0 +1,91 @@
+{{- $svc := index .Values.services "nachforderungen" }}
+{{- if $svc.enabled }}
+# The nachforderungen service keeps its OWN core.antraege table and every
+# Nachforderung has a FK onto it. The frontend's hardcoded Verfahren IDs
+# (see data-service-seed.yaml) exist in no backend — creating a
+# Nachforderung through the UI/API failed with a ForeignKeyViolation
+# (observed: 503 "NachforderungService CRUD-Fehler" on
+# create_nachforderungen). This job registers the fixed IDs as Anträge
+# and seeds one example Nachforderung for the default Antrag so the view
+# renders content; more can be created live through the app (that IS the
+# demo). Idempotent via ON CONFLICT DO NOTHING; waits for the service's
+# startup migration to create the schema.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nachforderungen-seed
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "6"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 8
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {{- include "spark-api.selectorLabels" "nachforderungen-seed" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: public.ecr.aws/docker/library/postgres:16
+          env:
+            - name: DB_HOST
+              value: {{ get $svc.env "DATABASE_HOST" | quote }}
+            - name: DB_PORT
+              value: {{ get $svc.env "DATABASE_PORT" | quote }}
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: rds-app, key: username } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: rds-app, key: password } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              export PGHOST="$DB_HOST" PGPORT="$DB_PORT" PGDATABASE=nachforderungen \
+                     PGUSER="$DB_USER" PGPASSWORD="$DB_PASSWORD"
+              echo "waiting for core.antraege (created by the service's startup migration)"
+              for i in $(seq 1 60); do
+                if psql -tAc "select to_regclass('core.antraege')" | grep -q antraege; then break; fi
+                sleep 5
+              done
+              psql -v ON_ERROR_STOP=1 <<'SQL'
+              insert into core.antraege (id, antragsnummer, erstellt_am, erstellt_von, prozess_status)
+              values
+                ('399dc7e9-5dd2-4fb4-ba5a-967d8fd0b298', 'ANT-2024-0000', now(), 'demo-seed', 'in_bearbeitung'),
+                ('f3c9a1e2-7b4e-4b9f-9c4e-2f8d3a1c9b7e', 'ANT-2024-0001', now(), 'demo-seed', 'in_bearbeitung'),
+                ('a7d2c5f1-3e6b-4c2a-8f9e-1d4b7e9c2a3f', 'ANT-2024-0002', now(), 'demo-seed', 'in_bearbeitung'),
+                ('e9b1d7c4-2f3a-4c8e-9b1a-7d6f2e3c1b9a', 'ANT-2024-0003', now(), 'demo-seed', 'in_bearbeitung'),
+                ('5386e53e-6117-4748-a810-221eae2f7bf2', 'ANT-2024-0004', now(), 'demo-seed', 'in_bearbeitung'),
+                ('c265b10b-9990-4c78-93cd-871642f303e3', 'ANT-2024-0005', now(), 'demo-seed', 'in_bearbeitung'),
+                ('a7830304-a114-484d-a16d-5aa6545a8643', 'ANT-2024-0006', now(), 'demo-seed', 'in_bearbeitung'),
+                ('9e9d8817-1e6f-47d8-9f32-8ee40aa3cc75', 'ANT-2024-0007', now(), 'demo-seed', 'in_bearbeitung'),
+                ('e7de5681-2fe6-4f0b-befb-330578883dbb', 'ANT-2024-0008', now(), 'demo-seed', 'in_bearbeitung'),
+                ('091f4776-a2e2-4a72-9b12-fcf3c871166f', 'ANT-2024-0009', now(), 'demo-seed', 'in_bearbeitung'),
+                ('b3b63226-a19c-4ab8-b6e8-31c5f3c4b42e', 'ANT-2024-0010', now(), 'demo-seed', 'in_bearbeitung'),
+                ('d10eb301-61a3-4dee-ad54-4cf15772f735', 'ANT-2024-0011', now(), 'demo-seed', 'in_bearbeitung'),
+                ('1ba63550-5e98-45af-a638-c67dd1f8683b', 'ANT-2024-0012', now(), 'demo-seed', 'in_bearbeitung'),
+                ('93db7ab7-5eab-4229-90e5-b7708a85b075', 'ANT-2024-0013', now(), 'demo-seed', 'in_bearbeitung'),
+                ('257144c0-021e-43d9-9401-1724b04d590d', 'ANT-2024-0014', now(), 'demo-seed', 'in_bearbeitung'),
+                ('239a64f2-6a3d-45e6-9487-6aefbeef6110', 'ANT-2024-0015', now(), 'demo-seed', 'in_bearbeitung')
+              on conflict (id) do nothing;
+
+              insert into core.nachforderungen
+                (id, antrag_id, nachforderungs_nr, pruefart, prueflabel, titel, details, nachforderung,
+                 ist_ki_generiert_titel, ist_ki_generiert_details, ist_ki_generiert_nachforderung,
+                 erstellt_am, erstellt_von)
+              values (
+                'a1e0c9d2-0000-4000-8000-000000000001',
+                '399dc7e9-5dd2-4fb4-ba5a-967d8fd0b298',
+                1, 'Vollstaendigkeit', 'Vollstaendigkeit',
+                'Lageplan nachreichen',
+                'Der eingereichte Lageplan ist unvollstaendig (Blatt 2 fehlt).',
+                'Bitte reichen Sie den vollstaendigen Lageplan im Massstab 1:1000 nach.',
+                false, false, false, now(), 'demo-seed')
+              on conflict (id) do nothing;
+              SQL
+              echo "nachforderungen seed done"
+{{- end }}

@@ -1,0 +1,133 @@
+{{- if .Values.auth.enabled }}
+# Realm bootstrap for the perimeter (pattern from spark-workflow-demo,
+# reduced to what oauth2-proxy needs: realm, confidential client with the
+# /oauth2/callback redirect URI, demo user). Post-install hook, retries
+# until Keycloak is ready; every step is idempotent.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  bootstrap.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    KCADM=/opt/keycloak/bin/kcadm.sh
+    REALM="{{ .Values.auth.realm }}"
+    CLIENT="{{ .Values.auth.clientId }}"
+    API_URL="https://{{ .Values.auth.apiHost }}"
+
+    echo "Waiting for Keycloak ..."
+    for i in $(seq 1 60); do
+      if "$KCADM" config credentials --server http://keycloak:8080 \
+           --realm master --user admin --password "$KC_ADMIN_PASSWORD" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 10
+    done
+    "$KCADM" config credentials --server http://keycloak:8080 \
+      --realm master --user admin --password "$KC_ADMIN_PASSWORD"
+
+    if ! "$KCADM" get "realms/$REALM" >/dev/null 2>&1; then
+      "$KCADM" create realms -s "realm=$REALM" -s enabled=true
+    fi
+    "$KCADM" update "realms/$REALM" \
+      -s enabled=true \
+      -s loginWithEmailAllowed=true \
+      -s accessTokenLifespan=28800 \
+      -s ssoSessionIdleTimeout=86400 \
+      -s ssoSessionMaxLifespan=86400
+
+    client_id="$("$KCADM" get clients -r "$REALM" -q "clientId=$CLIENT" --fields id --format csv --noquotes 2>/dev/null | head -n 1)"
+    if [ -z "$client_id" ]; then
+      "$KCADM" create clients -r "$REALM" \
+        -s "clientId=$CLIENT" \
+        -s enabled=true \
+        -s publicClient=false \
+        -s "secret=$KC_CLIENT_SECRET" \
+        -s standardFlowEnabled=true \
+        -s directAccessGrantsEnabled=true
+      client_id="$("$KCADM" get clients -r "$REALM" -q "clientId=$CLIENT" --fields id --format csv --noquotes | head -n 1)"
+    fi
+    "$KCADM" update "clients/$client_id" -r "$REALM" \
+      -s "redirectUris=[\"${API_URL}/oauth2/callback\"]" \
+      -s "webOrigins=[\"${API_URL}\"]"
+
+    # oauth2-proxy (keycloak-oidc provider) validates that the client is in
+    # the token's aud claim — Keycloak does not put it there by default
+    # (observed: 500 on /oauth2/callback, "audience claims [aud] do not
+    # exist in claims"). Same audience mapper as the upstream bootstrap.
+    if ! "$KCADM" get "clients/$client_id/protocol-mappers/models" -r "$REALM" --fields name --format csv --noquotes | grep -qx "${CLIENT}-audience"; then
+      "$KCADM" create "clients/$client_id/protocol-mappers/models" -r "$REALM" \
+        -s "name=${CLIENT}-audience" \
+        -s protocol=openid-connect \
+        -s protocolMapper=oidc-audience-mapper \
+        -s "config.\"included.client.audience\"=$CLIENT" \
+        -s 'config."access.token.claim"=true' \
+        -s 'config."id.token.claim"=true'
+    fi
+
+    cat > /tmp/demo-user.json <<JSON
+    {
+      "users": [
+        {
+          "id": "{{ .Values.auth.demoUser.id }}",
+          "username": "${DEMO_USER_EMAIL}",
+          "email": "${DEMO_USER_EMAIL}",
+          "emailVerified": true,
+          "enabled": true,
+          "firstName": "{{ .Values.auth.demoUser.firstName }}",
+          "lastName": "{{ .Values.auth.demoUser.lastName }}",
+          "credentials": [
+            { "type": "password", "value": "${DEMO_USER_PASSWORD}", "temporary": false }
+          ]
+        }
+      ]
+    }
+    JSON
+    "$KCADM" create partialImport -r "$REALM" -s ifResourceExists=SKIP -o -f /tmp/demo-user.json
+    rm -f /tmp/demo-user.json
+    echo "Keycloak bootstrap finished."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keycloak-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 10
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "keycloak-bootstrap" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: {{ .Values.auth.keycloak.image }}
+          command: ["/bin/bash", "/scripts/bootstrap.sh"]
+          env:
+            - name: KC_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: keycloak-credentials, key: admin_password } }
+            - name: KC_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: keycloak-credentials, key: client_secret } }
+            - name: DEMO_USER_EMAIL
+              valueFrom: { secretKeyRef: { name: keycloak-credentials, key: demo_user_email } }
+            - name: DEMO_USER_PASSWORD
+              valueFrom: { secretKeyRef: { name: keycloak-credentials, key: demo_user_password } }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: keycloak-bootstrap, defaultMode: 0755 }
+{{- end }}

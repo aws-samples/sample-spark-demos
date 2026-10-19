@@ -1,0 +1,11 @@
+# Populated by the terraform k8s-addons module.
+region: ""
+route53ZoneId: ""
+acmeEmail: ""
+
+clusterSecretStore:
+  name: aws-secrets-manager
+
+issuer:
+  name: letsencrypt
+  server: https://acme-v02.api.letsencrypt.org/directory

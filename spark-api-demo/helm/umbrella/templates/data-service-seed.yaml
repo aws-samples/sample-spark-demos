@@ -1,0 +1,567 @@
+{{- $svc := index .Values.services "dokumentenaufbereitung-data-service" }}
+{{- if $svc.enabled }}
+# The data-service has NO migrations: it reflects existing tables at
+# runtime (SQLAlchemy automap) and crashes on an empty database (observed:
+# NoSuchTableError 'procedure'). Upstream creates the schema through the
+# mock-data generator — this hook job runs exactly that, with the same
+# image and env as the service. Seeds ONLY when the database is empty:
+# create_tables() drops+recreates, so reseeding on every upgrade rotated
+# all entity IDs and open browser sessions kept querying stale proposals
+# (observed: 404 bursts across dokumentensuche/norm-matching/subsumtion in
+# the inspector right after an apply).
+#
+# Invocation details (both observed as BackoffLimitExceeded otherwise):
+#   - `python` on PATH is the system interpreter; the app lives in the uv
+#     venv -> use /app/.venv/bin/python.
+#   - faker sits in the upstream *test* dependency group, which the runtime
+#     image does not install (uv sync --no-dev) -> install it ephemerally
+#     into the venv first (image runs as uid 1001 and /app is chowned to
+#     1001, so the venv is writable; version mirrors upstream test group).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-service-schema-seed
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 1200
+  template:
+    metadata:
+      labels: {{- include "spark-api.selectorLabels" "data-service-seed" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: "{{ .Values.global.registry }}/{{ .Values.global.repositoryPrefix }}/dokumentenaufbereitung-data-service:{{ $svc.tag | default .Values.global.tag }}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              export UV_CACHE_DIR=/tmp/uv-cache
+              uv pip install --python /app/.venv/bin/python --no-cache 'faker>=37.6.0'
+              /app/.venv/bin/python - <<'PY'
+              import asyncio
+              from sqlalchemy import inspect
+              from dokumentenaufbereitung_data_service.db.session_manager import session_manager
+              from dokumentenaufbereitung_data_service.mock_data.mock_data import create_tables, write_mock_data
+
+              async def has_data() -> bool:
+                  await session_manager.build_connection()
+                  assert session_manager.engine is not None
+                  def check(sync_conn):
+                      if not inspect(sync_conn).has_table("procedure"):
+                          return False
+                      count = sync_conn.exec_driver_sql('select count(*) from "procedure"').scalar()
+                      return bool(count and count > 0)
+                  try:
+                      async with session_manager.engine.connect() as conn:
+                          return await conn.run_sync(check)
+                  finally:
+                      await session_manager.close_connection()
+
+              # Cold-start race guard: on a fresh database the monorepo's
+              # startup migrations may create the shared `doc` table first,
+              # WITHOUT the mock-only `deleted` boolean — write_mock_data()
+              # and every mock-model query then crash-loop on
+              # UndefinedColumnError (observed: BackoffLimitExceeded took
+              # down the whole from-zero bootstrap). Patch it in BEFORE any
+              # mock-model access; `alter table if exists` is a no-op when
+              # this job wins the race and the table does not exist yet.
+              from sqlalchemy import text as _sql_text
+
+              async def pre_reconcile() -> None:
+                  await session_manager.build_connection()
+                  assert session_manager.engine is not None
+                  async with session_manager.engine.begin() as conn:
+                      # Mock-model SELECTs and INSERTs both carry `deleted`.
+                      await conn.execute(_sql_text(
+                          "alter table if exists doc add column if not exists "
+                          "deleted boolean not null default false"))
+                      # Monorepo shape declares upload_date NOT NULL without
+                      # default; the mock model does not know the column, so
+                      # every mock INSERT would hit a NotNullViolation. A
+                      # default keeps both writers happy (reconcile backfills
+                      # real values later). Conditional lives in Python, NOT
+                      # in a plpgsql DO block: Kubernetes rewrites `$$` in
+                      # container commands to `$` (its own escape syntax), so
+                      # dollar-quoted SQL arrives broken (observed:
+                      # PostgresSyntaxError 'at or near "$"').
+                      has_upload_date = (await conn.execute(_sql_text(
+                          "select 1 from information_schema.columns "
+                          "where table_schema = current_schema() "
+                          "and table_name = 'doc' "
+                          "and column_name = 'upload_date'"))).scalar()
+                      if has_upload_date:
+                          await conn.execute(_sql_text(
+                              "alter table doc alter column upload_date "
+                              "set default now()"))
+                  await session_manager.close_connection()
+
+              asyncio.run(pre_reconcile())
+
+              if asyncio.run(has_data()):
+                  print("data-service already seeded - keeping existing data (stable IDs)")
+              else:
+                  create_tables()
+                  write_mock_data()
+                  print("data-service schema + mock data ready")
+
+              # ---- Fixed frontend IDs (upstream-issue candidate) ----------
+              # The shell ships a HARDCODED Verfahren picker: 15 Testverfahren
+              # in shell/src/utilities/mocks/mockedAntraege.json plus
+              # DEFAULT_ANTRAG_ID in shell/src/hooks/useAntraege.ts — none of
+              # them exist in any backend (observed: every click lands in
+              # 404s, "Error Loading Documents"). Seed matching rows so the
+              # UI's fixed IDs resolve. Idempotent via existence checks and
+              # deterministic UUIDs; runs on every upgrade.
+              import hashlib
+              import uuid
+              import sqlalchemy
+              from sqlalchemy.ext.asyncio import AsyncSession
+
+              def _doc_id(proposal_id: str, n: int) -> uuid.UUID:
+                  """Deterministic document ID, mirrored by the SQL seeds."""
+                  key = f"spark-api-demo/doc/{proposal_id}/{n}"
+                  return uuid.UUID(hashlib.md5(key.encode()).hexdigest())
+
+              # Content of the two demo documents per Verfahren. Filenames and
+              # titles mirror the dokumentenpruefung Ist-Dokumente so viewer,
+              # completeness check and redaction all tell the same story. The
+              # body lines carry demo PII so the redaction flow has real
+              # candidates to find.
+              # Fact-dense with ONE deliberate contradiction (building
+              # height 12 m vs 15 m): the Konsistenzpruefung extracts facts
+              # per document and cross-checks them — with near-empty texts
+              # the fact extractor returned 0 facts and the upstream
+              # inconsistency batch crashed on the empty list (observed:
+              # konsistenz status FEHLER, "All inconsistency analysis
+              # batches failed"; upstream-issue candidate).
+              def _doc_payload(n: int, verfahren: str) -> tuple[str, list[str]]:
+                  if n == 1:
+                      return ("lageplan.pdf", [
+                          "Lageplan",
+                          f"Verfahren: {verfahren}",
+                          "Amtlicher Lageplan des Grundstuecks, Massstab 1:1000.",
+                          "Flurstueck 123/4, Gemarkung Beispielstadt, Blatt 1-2.",
+                          "Grundstuecksflaeche: 2.400 qm, Baufenster 40 m x 20 m.",
+                          "Geplantes Gebaeude: zweigeschossiges Buerogebaeude,",
+                          "Gebaeudehoehe 12 m, Grundflaeche 800 qm.",
+                          "Abstandsflaechen nach Landesbauordnung eingehalten.",
+                          "Erschliessung ueber die Musterstrasse (Nordseite).",
+                          "Antragsteller: Max Mustermann",
+                          "Anschrift: Musterstrasse 12, 12345 Beispielstadt",
+                          "Telefon: +49 30 1234567",
+                          "E-Mail: max.mustermann@example.com",
+                          "Demo-Dokument - automatisch generiert.",
+                      ])
+                  return ("baubeschreibung.pdf", [
+                      "Baubeschreibung",
+                      f"Verfahren: {verfahren}",
+                      "Zweigeschossiges Buerogebaeude in Holzhybridbauweise.",
+                      "Gebaeudehoehe 15 m, Grundflaeche 800 qm.",
+                      "Nutzflaeche 1.200 qm, Flachdach mit PV-Anlage (30 kWp).",
+                      "Flurstueck 123/4, Gemarkung Beispielstadt.",
+                      "Stellplaetze: 24 PKW, davon 2 barrierefrei.",
+                      "Erschliessung ueber die Musterstrasse (Nordseite).",
+                      "Bauherr: Erika Musterfrau",
+                      "Anschrift: Beispielweg 7, 54321 Musterhausen",
+                      "Telefon: +49 89 7654321",
+                      "Demo-Dokument - automatisch generiert.",
+                  ])
+
+              def _minimal_pdf(lines: list[str]) -> bytes:
+                  """Hand-rolled single-page PDF (no extra deps in the image)."""
+                  def esc(s: str) -> str:
+                      return (s.replace("\\", "\\\\")
+                               .replace("(", "\\(")
+                               .replace(")", "\\)"))
+                  parts = ["BT /F1 16 Tf 72 770 Td"]
+                  for idx, ln in enumerate(lines):
+                      if idx == 0:
+                          parts.append(f"({esc(ln)}) Tj")
+                          parts.append("/F1 11 Tf")
+                      else:
+                          parts.append(f"0 -22 Td ({esc(ln)}) Tj")
+                  parts.append("ET")
+                  stream = "\n".join(parts).encode("latin-1", "replace")
+                  objs = [
+                      b"<< /Type /Catalog /Pages 2 0 R >>",
+                      b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                      (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+                       b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"),
+                      b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+                      (b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n"
+                       + stream + b"\nendstream"),
+                  ]
+                  out = bytearray(b"%PDF-1.4\n")
+                  offsets = []
+                  for i, body in enumerate(objs, start=1):
+                      offsets.append(len(out))
+                      out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+                  xref_pos = len(out)
+                  out += f"xref\n0 {len(objs) + 1}\n".encode()
+                  out += b"0000000000 65535 f \n"
+                  for off in offsets:
+                      out += f"{off:010d} 00000 n \n".encode()
+                  out += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\n"
+                          f"startxref\n{xref_pos}\n%%EOF").encode()
+                  return bytes(out)
+              from dokumentenaufbereitung_data_service.mock_data.mock_tables import (
+                  ChunkMetadata, Doc, Page, Procedure, Proposal, User)
+
+              def _chunk_id(proposal_id: str, n: int) -> uuid.UUID:
+                  """Deterministic chunk ID, shared with the dokumenten-
+                  pruefung seed's chunk mirror derivation."""
+                  key = f"spark-api-demo/chunk/{proposal_id}/{n}"
+                  return uuid.UUID(hashlib.md5(key.encode()).hexdigest())
+
+              def _page_id(proposal_id: str, n: int) -> uuid.UUID:
+                  key = f"spark-api-demo/page/{proposal_id}/{n}"
+                  return uuid.UUID(hashlib.md5(key.encode()).hexdigest())
+
+              PROCEDURE_ID = uuid.UUID("916db04d-746d-4ee9-a5af-c6f723f10262")
+              DEFAULT_ANTRAG = uuid.UUID("399dc7e9-5dd2-4fb4-ba5a-967d8fd0b298")
+              USER_ID = uuid.uuid5(uuid.NAMESPACE_URL, "spark-api-demo/seed-user")
+              TESTVERFAHREN = {
+                  "f3c9a1e2-7b4e-4b9f-9c4e-2f8d3a1c9b7e": "Testverfahren 1",
+                  "a7d2c5f1-3e6b-4c2a-8f9e-1d4b7e9c2a3f": "Testverfahren 2",
+                  "e9b1d7c4-2f3a-4c8e-9b1a-7d6f2e3c1b9a": "Testverfahren 3",
+                  "5386e53e-6117-4748-a810-221eae2f7bf2": "Testverfahren 4",
+                  "c265b10b-9990-4c78-93cd-871642f303e3": "Testverfahren 5",
+                  "a7830304-a114-484d-a16d-5aa6545a8643": "Testverfahren 6",
+                  "9e9d8817-1e6f-47d8-9f32-8ee40aa3cc75": "Testverfahren 7",
+                  "e7de5681-2fe6-4f0b-befb-330578883dbb": "Testverfahren 8",
+                  "091f4776-a2e2-4a72-9b12-fcf3c871166f": "Testverfahren 9",
+                  "b3b63226-a19c-4ab8-b6e8-31c5f3c4b42e": "Testverfahren 10",
+                  "d10eb301-61a3-4dee-ad54-4cf15772f735": "Testverfahren 11",
+                  "1ba63550-5e98-45af-a638-c67dd1f8683b": "Testverfahren 12",
+                  "93db7ab7-5eab-4229-90e5-b7708a85b075": "Testverfahren 13",
+                  "257144c0-021e-43d9-9401-1724b04d590d": "Testverfahren 14",
+                  "239a64f2-6a3d-45e6-9487-6aefbeef6110": "Testverfahren 15",
+                  str(DEFAULT_ANTRAG): "Testverfahren (Default)",
+              }
+
+              import os
+              from dokumentenaufbereitung_data_service.services.object_storage import ObjectStorage
+
+              # ---- Monorepo schema reconciliation (upstream-issue candidate) --
+              # Both dokumentenaufbereitung services share one database, but
+              # the mock generator's create_tables() recreates shared tables
+              # in an OLDER shape than the monorepo's startup migrations —
+              # and those migrations never re-run (schema_migrations rows
+              # survive the drop). Observed: GET /status/{proposal} 500
+              # "column pipeline_status.filename does not exist". Mirror the
+              # missing columns from the monorepo's migration steps 000/006/
+              # 007/008 (ADD COLUMN IF NOT EXISTS = idempotent).
+              RECONCILE_SQL = [
+                  # pipeline_status: monorepo shape (007 + 008)
+                  "alter table if exists pipeline_status add column if not exists workflow_id uuid",
+                  "alter table if exists pipeline_status add column if not exists current_step text",
+                  "alter table if exists pipeline_status add column if not exists sub_step text",
+                  "alter table if exists pipeline_status add column if not exists failed_step text",
+                  "alter table if exists pipeline_status add column if not exists failed_sub_step text",
+                  "alter table if exists pipeline_status add column if not exists error text",
+                  "alter table if exists pipeline_status add column if not exists antrag_id uuid",
+                  "alter table if exists pipeline_status add column if not exists filename text",
+                  "alter table if exists pipeline_status add column if not exists deleted_at timestamp",
+                  # backfills mirroring migration 008
+                  """update pipeline_status ps set antrag_id = d.proposal_id
+                     from doc d where ps.doc_id = d.id and ps.antrag_id is null""",
+                  """update pipeline_status ps set filename = d.filename
+                     from doc d where ps.doc_id = d.id and ps.filename is null""",
+                  # doc: mock-only column missing when the monorepo migrations
+                  # win the cold-start race for this table (fresh DB: the
+                  # monorepo creates doc first, mock create_tables only adds
+                  # missing tables; observed: seed crash-loop
+                  # UndefinedColumnError "column doc.deleted does not exist"
+                  # -> BackoffLimitExceeded aborted the whole bootstrap).
+                  "alter table if exists doc add column if not exists deleted boolean not null default false",
+                  "update doc set deleted = true where deleted_at is not null and deleted = false",
+                  # doc: monorepo columns (000 initial + 006)
+                  "alter table if exists doc add column if not exists summary text",
+                  "alter table if exists doc add column if not exists upload_date timestamp",
+                  "alter table if exists doc add column if not exists created_at timestamp default now()",
+                  "alter table if exists doc add column if not exists updated_at timestamp default now()",
+                  "alter table if exists doc add column if not exists created_by varchar(255)",
+                  "alter table if exists doc add column if not exists updated_by varchar(255)",
+                  "alter table if exists doc add column if not exists deleted_by varchar(255)",
+                  "update doc set upload_date = coalesce(upload_date, created_at, now()) where upload_date is null",
+                  # proposal / user: audit columns the monorepo entities select
+                  "alter table if exists proposal add column if not exists created_at timestamp default now()",
+                  "alter table if exists proposal add column if not exists updated_at timestamp default now()",
+                  'alter table if exists "user" add column if not exists created_at timestamp default now()',
+                  'alter table if exists "user" add column if not exists updated_at timestamp default now()',
+              ]
+              # current_step backfill only where the mock 'status' column exists
+              RECONCILE_STATUS_BACKFILL = """
+                  update pipeline_status set current_step = coalesce(current_step, status)
+                  where current_step is null
+              """
+
+              async def reconcile_monorepo_columns() -> None:
+                  await session_manager.build_connection()
+                  assert session_manager.engine is not None
+                  async with session_manager.engine.begin() as conn:
+                      for stmt in RECONCILE_SQL:
+                          await conn.execute(sqlalchemy.text(stmt))
+                      has_status_col = (await conn.execute(sqlalchemy.text(
+                          "select 1 from information_schema.columns "
+                          "where table_schema = current_schema() "
+                          "and table_name = 'pipeline_status' and column_name = 'status'"
+                      ))).scalar()
+                      if has_status_col:
+                          await conn.execute(sqlalchemy.text(RECONCILE_STATUS_BACKFILL))
+                  await session_manager.close_connection()
+                  print("monorepo schema reconciliation applied")
+
+              S3_BUCKET = os.environ["OBJECT_STORAGE_BUCKET_NAME"]
+              S3_ENDPOINT = os.environ["OBJECT_STORAGE_URL"]
+              S3_REGION = os.environ["OBJECT_STORAGE_REGION_NAME"]
+
+              # (proposal_id, n) -> True = PDF must be (re)written,
+              # False = row content unchanged, absent = new row (upload).
+              # Filled by ensure_fixed_ids, consumed by ensure_pdf_objects.
+              PDF_REFRESH: dict = {}
+
+              async def ensure_pdf_objects() -> None:
+                  """Upload the demo PDFs the seeded doc rows point at.
+
+                  The GET /documents/{id}/pdf endpoint presigns object_key on
+                  the service's configured bucket — without a real object the
+                  browser gets a NoSuchKey 404 (observed: PDF viewer rendered
+                  0 pages, redaction view stuck on its loading state).
+                  Idempotent: skips keys that already exist.
+                  """
+                  storage = ObjectStorage(bucket_name=S3_BUCKET)
+                  await storage.build_connection()
+                  uploaded = 0
+                  try:
+                      for pid_str, name in TESTVERFAHREN.items():
+                          for i in (1, 2):
+                              key = f"docs/{_doc_id(pid_str, i)}.pdf"
+                              # Re-upload on content changes too: the doc-row
+                              # refresh below compares document_text, so the
+                              # PDFs must follow the same revision.
+                              if PDF_REFRESH.get((pid_str, i)) is False and await storage.file_exists(key):
+                                  continue
+                              _, lines = _doc_payload(i, name)
+                              await storage.upload_file_from_bytes(
+                                  _minimal_pdf(lines), key)
+                              uploaded += 1
+                  finally:
+                      await storage.close_connection()
+                  print(f"demo PDFs ensured ({uploaded} uploaded)")
+
+              async def ensure_fixed_ids() -> None:
+                  await session_manager.build_connection()
+                  assert session_manager.engine is not None
+                  added = 0
+                  async with AsyncSession(session_manager.engine) as s:
+                      # chunk_metadata exists in TWO shapes depending on who
+                      # won the cold-start table race: mock (labels varchar)
+                      # vs monorepo (labels text[]; observed: seed insert
+                      # DatatypeMismatchError 'column "labels" is of type
+                      # text[]'). Probe once, then write chunks via raw SQL
+                      # with explicit casts on the monorepo shape.
+                      labels_type = (await s.execute(sqlalchemy.text(
+                          "select data_type from information_schema.columns "
+                          "where table_schema = current_schema() "
+                          "and table_name = 'chunk_metadata' "
+                          "and column_name = 'labels'"))).scalar()
+                      chunks_raw = labels_type == 'ARRAY'
+                      # Repair pass for rows seeded with a list value before
+                      # the dict_type fix (idempotent, no-op afterwards).
+                      await s.execute(sqlalchemy.text(
+                          "update doc set document_metadata_entities = '{}'::json "
+                          "where document_metadata_entities::text = '[]'"))
+                      if not await s.get(Procedure, PROCEDURE_ID):
+                          s.add(Procedure(id=PROCEDURE_ID,
+                                          name="Genehmigungsverfahren (Frontend-Testdaten)",
+                                          category="Legal"))
+                          added += 1
+                      if not await s.get(User, USER_ID):
+                          s.add(User(id=USER_ID, first_name="Sam",
+                                     last_name="Sachbearbeiter",
+                                     email="sam.sachbearbeiter@example.com",
+                                     organization="Demo-Behoerde"))
+                          added += 1
+                      for pid_str, name in TESTVERFAHREN.items():
+                          pid = uuid.UUID(pid_str)
+                          if not await s.get(Proposal, pid):
+                              s.add(Proposal(id=pid, name=name,
+                                             organization="Demo-Behoerde",
+                                             procedure_id=PROCEDURE_ID))
+                              added += 1
+                          for i in (1, 2):
+                              # md5-derived so the dokumentenpruefung seed can
+                              # compute the identical IDs in plain SQL and link
+                              # its Ist-Dokumente to documents this API really
+                              # returns (its startup cleanup soft-deletes any
+                              # Ist-Dokument whose linked document is absent).
+                              did = _doc_id(pid_str, i)
+                              fname, lines = _doc_payload(i, name)
+                              obj_key = f"docs/{did}.pdf"
+                              doc_text = " ".join(lines)
+                              existing = await s.get(Doc, did)
+                              if existing is None:
+                                  s.add(Doc(
+                                      id=did,
+                                      filetype="pdf",
+                                      filename=fname,
+                                      link_to_file=f"{S3_ENDPOINT}/{S3_BUCKET}/{obj_key}",
+                                      document_text=doc_text,
+                                      # "Antrag": norm-matching selects the
+                                      # proposal documents to match by this
+                                      # type (observed: match jobs failed
+                                      # with "No document IDs provided" on
+                                      # type 'report'); also matches the
+                                      # shell's document filter list.
+                                      document_type="Antrag",
+                                      endpoint=S3_ENDPOINT,
+                                      bucket=S3_BUCKET,
+                                      object_key=obj_key,
+                                      region=S3_REGION,
+                                      # dict, not list — the DocumentResponse
+                                      # schema validates dict_type (observed:
+                                      # 500/502 chain with input_value=[]).
+                                      document_metadata_entities={},
+                                      status="completed",
+                                      proposal_id=pid,
+                                      user_id=USER_ID,
+                                      deleted=False,
+                                  ))
+                                  added += 1
+                              elif (existing.bucket != S3_BUCKET
+                                    or existing.document_text != doc_text
+                                    or existing.document_type != "Antrag"):
+                                  # Repair placeholder-bucket-era rows AND
+                                  # refresh rows whose seed content changed
+                                  # (the ist-doc texts and PDFs must stay in
+                                  # sync across seed revisions).
+                                  existing.filename = fname
+                                  existing.link_to_file = f"{S3_ENDPOINT}/{S3_BUCKET}/{obj_key}"
+                                  existing.document_text = doc_text
+                                  existing.document_type = "Antrag"
+                                  existing.endpoint = S3_ENDPOINT
+                                  existing.bucket = S3_BUCKET
+                                  existing.region = S3_REGION
+                                  PDF_REFRESH[(pid_str, i)] = True
+                                  added += 1
+                              else:
+                                  PDF_REFRESH[(pid_str, i)] = False
+
+                              # Page + chunk metadata: norm-matching reads
+                              # /documents/{id}/chunkmetadata to select the
+                              # text to match (observed: match jobs failed
+                              # "No chunks found for provided 2 document
+                              # IDs" without these rows). One page and one
+                              # chunk per demo document, IDs shared with
+                              # the dokumentenpruefung chunk mirror.
+                              page_uuid = _page_id(pid_str, i)
+                              if not await s.get(Page, page_uuid):
+                                  s.add(Page(
+                                      id=page_uuid,
+                                      page_name="S.1",
+                                      page_number=1,
+                                      page_height=842,
+                                      page_width=595,
+                                      bboxes_json={},
+                                      chunk_ids=[str(_chunk_id(pid_str, i))],
+                                      doc_id=did,
+                                  ))
+                                  added += 1
+                              chunk_uuid = _chunk_id(pid_str, i)
+                              if chunks_raw:
+                                  # Monorepo shape: labels text[], entities
+                                  # jsonb — mock-model INSERTs mismatch, so
+                                  # upsert via SQL with explicit casts.
+                                  # Raw statements bypass the ORM's flush
+                                  # ordering: push pending doc/page adds to
+                                  # the DB first or the chunk FK fails
+                                  # (observed: ForeignKeyViolationError
+                                  # chunk_metadata_page_id_fkey).
+                                  await s.flush()
+                                  res = await s.execute(sqlalchemy.text(
+                                      "insert into chunk_metadata "
+                                      "(id, labels, entities, entities_law, "
+                                      " chunk_id, chunk_text, bbox_json, "
+                                      " pharia_doc_name, doc_id, page_id) "
+                                      "values (:id, array['text']::text[], "
+                                      " '{}'::jsonb, '{}'::jsonb, :cid, "
+                                      " :ctext, '{}'::jsonb, :fname, :did, "
+                                      " :pgid) "
+                                      "on conflict (id) do update "
+                                      "set chunk_text = excluded.chunk_text "
+                                      "where chunk_metadata.chunk_text "
+                                      "  is distinct from excluded.chunk_text"),
+                                      {"id": str(chunk_uuid),
+                                       "cid": str(chunk_uuid),
+                                       "ctext": doc_text,
+                                       "fname": fname,
+                                       "did": str(did),
+                                       "pgid": str(page_uuid)})
+                                  added += res.rowcount or 0
+                              else:
+                                  existing_chunk = await s.get(ChunkMetadata, chunk_uuid)
+                                  if existing_chunk is None:
+                                      s.add(ChunkMetadata(
+                                          id=chunk_uuid,
+                                          labels="text",
+                                          entities={},
+                                          entities_law={},
+                                          chunk_id=chunk_uuid,
+                                          chunk_text=doc_text,
+                                          bbox_json={},
+                                          pharia_doc_name=fname,
+                                          doc_id=did,
+                                          page_id=page_uuid,
+                                      ))
+                                      added += 1
+                                  elif existing_chunk.chunk_text != doc_text:
+                                      existing_chunk.chunk_text = doc_text
+                                      added += 1
+                      # Drop documents from the earlier uuid5-based derivation
+                      # so the demo does not accumulate duplicates.
+                      legacy = [
+                          uuid.uuid5(uuid.NAMESPACE_URL, f"spark-api-demo/doc/{pid}/{n}")
+                          for pid in TESTVERFAHREN
+                          for n in (1, 2)
+                      ]
+                      await s.execute(
+                          sqlalchemy.delete(Doc).where(Doc.id.in_(legacy))
+                      )
+                      await s.commit()
+                  await session_manager.close_connection()
+                  print(f"fixed frontend IDs ensured ({added} rows added)")
+
+              asyncio.run(reconcile_monorepo_columns())
+              # Order matters: ensure_fixed_ids fills PDF_REFRESH, which
+              # ensure_pdf_objects consumes to skip unchanged objects.
+              asyncio.run(ensure_fixed_ids())
+              asyncio.run(ensure_pdf_objects())
+              PY
+          env:
+            {{- range $key, $spec := $svc.env }}
+            - name: {{ $key }}
+              {{- if kindIs "map" $spec }}
+              {{- if $spec.secret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $spec.secret.name }}
+                  key: {{ $spec.secret.key }}
+              {{- else if $spec.fieldRef }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: {{ $spec.fieldRef }}
+              {{- end }}
+              {{- else }}
+              value: {{ $spec | quote }}
+              {{- end }}
+            {{- end }}
+{{- end }}

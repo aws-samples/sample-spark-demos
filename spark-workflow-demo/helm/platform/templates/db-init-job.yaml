@@ -1,0 +1,164 @@
+{{- if .Values.dbInit.enabled }}
+# Database bootstrap against RDS. Mirrors the upstream docker-compose
+# postgresql_init_sql/seed logic 1:1 as a Kubernetes pre-install job:
+#   - dedicated roles (app, temporal, keycloak, spicedb)
+#   - all application databases incl. pgvector extension
+#   - gesetze-normen seed (downloaded from S3, uploaded there by terraform
+#     from the unmodified upstream submodule)
+# Idempotent: databases/roles are created only when absent; the seed is
+# only imported into an empty gesetze-normen database.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init-scripts
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-8"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  init.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    export PGHOST="{{ .Values.rds.host }}"
+    export PGPORT="{{ .Values.rds.port }}"
+    export PGDATABASE=postgres
+
+    role_exists() { psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$1'" | grep -q 1; }
+    db_exists()   { psql -tAc "SELECT 1 FROM pg_database WHERE datname='$1'" | grep -q 1; }
+
+    echo "==> Creating roles"
+    for role in app temporal keycloak spicedb; do
+      pw_var="PW_$(echo "$role" | tr '[:lower:]' '[:upper:]')"
+      if ! role_exists "spark_${role}"; then
+        psql -v ON_ERROR_STOP=1 -c "CREATE ROLE spark_${role} LOGIN PASSWORD '${!pw_var}'"
+        echo "    role spark_${role} created"
+      fi
+    done
+
+    echo "==> Creating databases"
+    owner_for() {
+      case "$1" in
+        temporal) echo spark_temporal ;;
+        keycloak) echo spark_keycloak ;;
+        spicedb)  echo spark_spicedb ;;
+        *)        echo spark_app ;;
+      esac
+    }
+    {{- range .Values.dbInit.databases }}
+    if ! db_exists "{{ . }}"; then
+      psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"{{ . }}\" OWNER $(owner_for "{{ . }}")"
+      echo "    database {{ . }} created"
+    fi
+    {{- end }}
+
+    echo "==> Enabling pgvector"
+    {{- range .Values.dbInit.vectorDatabases }}
+    psql -v ON_ERROR_STOP=1 -d "{{ . }}" -c "CREATE EXTENSION IF NOT EXISTS vector"
+    {{- end }}
+
+    echo "==> Temporal visibility database"
+    if ! db_exists "temporal_visibility"; then
+      psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE temporal_visibility OWNER spark_temporal"
+    fi
+
+    echo "==> Seeding {{ .Values.dbInit.seedDatabase }} (skipped when tables already present)"
+    tables=$(psql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'" -d "{{ .Values.dbInit.seedDatabase }}")
+    if [ "${tables}" = "0" ] && [ -f /work/seed.sql.gz ]; then
+      # sed mirrors upstream compose: strip pg_dump-17-only statements.
+      gunzip -c /work/seed.sql.gz \
+        | sed -e '/^\\restrict /d' -e '/^\\unrestrict /d' -e '/^SET transaction_timeout/d' \
+        | psql -v ON_ERROR_STOP=1 -d "{{ .Values.dbInit.seedDatabase }}"
+      psql -v ON_ERROR_STOP=1 -d "{{ .Values.dbInit.seedDatabase }}" \
+        -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO spark_app; ALTER DATABASE {{ .Values.dbInit.seedDatabase | quote }} OWNER TO spark_app"
+      echo "    seed imported"
+    else
+      echo "    seed skipped (tables=${tables})"
+    fi
+    echo "==> Database init finished"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels: {{- include "spark-platform.selectorLabels" "db-init" | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: fetch-seed
+          image: {{ .Values.dbInit.awsCliImage }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - aws s3 cp "s3://{{ .Values.s3.dmsBucket }}/{{ .Values.s3.seedObjectKey }}" /work/seed.sql.gz && ls -la /work
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: s3-app, key: S3_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: s3-app, key: S3_SECRET_ACCESS_KEY } }
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.s3.region }}
+          volumeMounts:
+            - { name: work, mountPath: /work }
+      containers:
+        - name: init-db
+          image: {{ .Values.dbInit.image }}
+          command: ["/bin/bash", "/scripts/init.sh"]
+          env:
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: rds-master, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: rds-master, key: password } }
+            - name: PW_APP
+              valueFrom: { secretKeyRef: { name: db-user-passwords, key: app } }
+            - name: PW_TEMPORAL
+              valueFrom: { secretKeyRef: { name: db-user-passwords, key: temporal } }
+            - name: PW_KEYCLOAK
+              valueFrom: { secretKeyRef: { name: db-user-passwords, key: keycloak } }
+            - name: PW_SPICEDB
+              valueFrom: { secretKeyRef: { name: db-user-passwords, key: spicedb } }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+            - { name: work, mountPath: /work }
+      volumes:
+        - name: scripts
+          configMap: { name: db-init-scripts, defaultMode: 0755 }
+        - name: work
+          emptyDir: {}
+---
+# Per-role passwords for the init job (hooked so it exists before the job).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-user-passwords
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { kind: ClusterSecretStore, name: {{ .Values.clusterSecretStore }} }
+  target: { name: db-user-passwords }
+  data:
+    - secretKey: app
+      remoteRef: { key: {{ .Values.secretsManager.rdsApp }}, property: password }
+    - secretKey: temporal
+      remoteRef: { key: {{ .Values.secretsManager.rdsTemporal }}, property: password }
+    - secretKey: keycloak
+      remoteRef: { key: {{ .Values.secretsManager.rdsKeycloak }}, property: password }
+    - secretKey: spicedb
+      remoteRef: { key: {{ .Values.secretsManager.rdsSpicedb }}, property: password }
+{{- end }}

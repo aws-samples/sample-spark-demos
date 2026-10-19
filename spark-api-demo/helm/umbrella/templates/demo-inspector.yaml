@@ -1,0 +1,67 @@
+{{- if .Values.inspector.enabled }}
+# Demo inspector — MIT-0 demo tooling from THIS repo (not upstream). The
+# overlay script is injected into the frontend's index.html at the demo
+# edge (ingress sub_filter, see ingress.yaml); this deployment serves the
+# script and aggregates backend activity (LiteLLM request log -> Amazon
+# Bedrock, RabbitMQ queues, CloudWatch Bedrock metrics) into an SSE stream.
+# Read-only against every source; sits behind the OIDC perimeter like
+# everything else on the host.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo-inspector
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-inspector
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-api.selectorLabels" "demo-inspector" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api.selectorLabels" "demo-inspector" | nindent 8 }}
+    spec:
+      # Pod identity association (CloudWatch read) binds to this SA.
+      serviceAccountName: demo-inspector
+      containers:
+        - name: inspector
+          image: "{{ .Values.global.registry }}/{{ .Values.global.repositoryPrefix }}/demo-inspector:{{ .Values.inspector.tag | default .Values.global.tag }}"
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - name: LITELLM_BASE
+              value: {{ .Values.inspector.litellmBase | quote }}
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: litellm, key: master_key } }
+            - name: RABBITMQ_MGMT_URL
+              value: {{ .Values.inspector.rabbitmqMgmtUrl | quote }}
+            - name: RABBITMQ_USER
+              valueFrom: { secretKeyRef: { name: rabbitmq, key: username } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: rabbitmq, key: password } }
+            - name: BEDROCK_REGION
+              value: {{ .Values.inspector.bedrockRegion | quote }}
+          readinessProbe:
+            httpGet: { path: /demo-inspector/health, port: http }
+            initialDelaySeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-inspector
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-api.selectorLabels" "demo-inspector" | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http }
+{{- end }}

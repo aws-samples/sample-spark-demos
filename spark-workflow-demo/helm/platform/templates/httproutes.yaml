@@ -1,0 +1,236 @@
+# Gateway API routes for the demo hosts. The Gateway itself (incl. TLS) is
+# created by the terraform k8s-addons module; external-dns publishes the
+# hostnames from these HTTPRoutes into Route53.
+#
+# API routing mirrors the upstream frontend contract (configureClients.ts +
+# vite dev proxy): the SPA calls ${VITE_API_BASE_URL}<prefix>/..., the
+# platform strips /api plus the client prefix (except /temporal, which the
+# temporal-job-service expects to keep) and forwards to the backend service
+# in the app namespace.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frontend
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Values.gateway.namespace }}
+  hostnames:
+    - {{ .Values.hosts.frontend }}
+  rules:
+    {{- range .Values.apiRoutes }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api{{ .prefix }}
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: {{ .rewrite | default "/" | quote }}
+      backendRefs:
+        - name: {{ $.Values.appReleaseName }}-{{ .service }}
+          namespace: {{ $.Values.appNamespace }}
+          port: {{ .port | default 80 }}
+    {{- end }}
+    # SPA fallback: everything else is served by the frontend nginx.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ .Values.appReleaseName }}-frontend
+          namespace: {{ .Values.appNamespace }}
+          port: {{ .Values.frontendServicePort }}
+---
+# SPA under /app: the frontend image templates VITE_BASE_URL=/app into
+# index.html, but its nginx serves from the web root (/assets/...) — strip
+# the prefix at the gateway (mirrors the upstream Envoy setup). Without
+# this, /app/ loads via the nginx SPA fallback but every asset request
+# 404s (observed: blank page, all /app/assets/*.js 404).
+# Separate HTTPRoute because the frontend route already carries 16 rules
+# (the Kubernetes maximum); Gateway API matches by longest path prefix
+# across all routes of the same hostname, so /app wins over /.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frontend-app
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Values.gateway.namespace }}
+  hostnames:
+    - {{ .Values.hosts.frontend }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /app
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: {{ .Values.appReleaseName }}-frontend
+          namespace: {{ .Values.appNamespace }}
+          port: {{ .Values.frontendServicePort }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: keycloak
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Values.gateway.namespace }}
+  hostnames:
+    - {{ .Values.hosts.keycloak }}
+  rules:
+    - backendRefs:
+        - name: keycloak
+          port: 8080
+---
+# The login front-channel above has to be public, the ADMIN surface must
+# not be (observed in an external security scan of the live demo:
+# https://<keycloak-host>/realms/master/protocol/openid-connect/auth
+# ?client_id=security-admin-console — the master realm's admin console was
+# reachable from the internet, guarded only by the bootstrap admin
+# password). Everything the demo needs lives in the `local` realm; admin
+# access goes through `kubectl port-forward svc/keycloak 8080:8080`.
+# Gateway API matches the longest path prefix ACROSS all routes of a
+# hostname, so these two prefixes win over the catch-all rule above.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: deny-admin-surface
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  directResponse:
+    statusCode: 403
+    contentType: text/plain
+    body:
+      type: Inline
+      inline: "Forbidden: the Keycloak admin surface is not exposed publicly.\n"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: keycloak-admin-denied
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Values.gateway.namespace }}
+  hostnames:
+    - {{ .Values.hosts.keycloak }}
+  rules:
+    # No backendRefs: the directResponse filter terminates the request.
+    # Scope is deliberately /admin/master and NOT /admin: Keycloak serves
+    # the console for EVERY realm under /admin/master/console, while the
+    # token-protected admin REST API lives under /admin/realms/<realm> —
+    # and identity-management-service calls exactly that through the public
+    # hostname (AUTH_BASE_URL), so a blanket /admin deny would break user
+    # management (GET /users 500).
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /admin/master
+        - path:
+            type: PathPrefix
+            value: /realms/master
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: deny-admin-surface
+---
+# Allow HTTPRoutes in the platform namespace to reference Services in the
+# app namespace (frontend, API services, temporal web).
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: platform-routes-to-app-services
+  namespace: {{ .Values.appNamespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ .Release.Namespace }}
+  to:
+    - group: ""
+      kind: Service
+{{- if .Values.temporalUi.enabled }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: temporal-ui
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Values.gateway.namespace }}
+  hostnames:
+    - {{ .Values.hosts.temporal }}
+  rules:
+    - backendRefs:
+        - name: {{ .Values.temporalUi.serviceName }}
+          namespace: {{ .Values.appNamespace }}
+          port: {{ .Values.temporalUi.servicePort }}
+{{- end }}
+{{- if .Values.oidcPolicy.enabled }}
+---
+# Perimeter login via Envoy Gateway native OIDC (replaces oauth2-proxy in the
+# request path — same pattern the upstream architecture describes: Envoy +
+# OIDC identity provider). Keycloak itself stays public for the login flow.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: frontend-oidc
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    # Both routes serve the same hostname, so one policy with one
+    # redirectURL covers them (cookies are host-scoped, not route-scoped).
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: frontend
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: frontend-app
+  oidc:
+    {{- include "spark-platform.oidcCommon" . | nindent 4 }}
+    redirectURL: https://{{ .Values.hosts.frontend }}/oauth2/callback
+{{- if .Values.temporalUi.enabled }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: temporal-oidc
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: temporal-ui
+  oidc:
+    {{- include "spark-platform.oidcCommon" . | nindent 4 }}
+    redirectURL: https://{{ .Values.hosts.temporal }}/oauth2/callback
+{{- end }}
+{{- end }}

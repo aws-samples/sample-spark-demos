@@ -1,0 +1,587 @@
+# Rendered by terraform (templatefile) into the umbrella's values.
+# THE wiring matrix: env contract per service, extracted from each
+# service's settings/config module in the upstream source. Conventions:
+#   - LLM (OpenAI-compatible) -> in-cluster LiteLLM (Bedrock backend)
+#   - APP_ENV=dev everywhere: all traffic is same-origin behind one host,
+#     and non-dev environments enforce ALLOWED_ORIGINS in most services
+#   - BIZLOG_FALLBACK_ONLY=true: audit events log locally, no broker dep
+#   - Pharia Document Index/reranker: placeholder values, documented
+#     functional gap (proprietary SaaS)
+#   - NODE_IP via downward API where services export traces (disabled)
+
+global:
+  registry: "${ecr_registry}"
+  repositoryPrefix: "${ecr_prefix}"
+  tag: "${image_tag}"
+  defaultResources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }
+
+ingress:
+  host: "${api_host}"
+  clusterIssuer: letsencrypt
+  maxBodySize: 64m
+
+# OIDC perimeter (Keycloak + oauth2-proxy from the platform chart).
+auth:
+  enabled: ${auth_enabled}
+  platformNamespace: "${platform_namespace}"
+
+# Demo inspector (MIT-0 tooling from this repo, injected at the edge):
+# makes the API character of the product visible — live browser API calls
+# plus the backend activity behind them (LiteLLM -> Bedrock, RabbitMQ,
+# CloudWatch). Read-only everywhere.
+inspector:
+  enabled: ${inspector_enabled}
+  litellmBase: "${litellm_base}"
+  rabbitmqMgmtUrl: "http://rabbitmq.${platform_namespace}.svc.cluster.local:15672"
+  bedrockRegion: "${bedrock_region}"
+
+services:
+  berichtskonfigurator:
+    enabled: true
+    port: 8001
+    env:
+      ENVIRONMENT: development
+      POSTGRES_HOST: "${rds_host}"
+      POSTGRES_PORT: "${rds_port}"
+      POSTGRES_DB: berichtskonfigurator
+      POSTGRES_USER: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      LLM_PROVIDER: mistral
+      MISTRAL_API_KEY: { secret: { name: litellm, key: master_key } }
+      # The LangChain-Mistral generator reads response CONTENT only; the
+      # gpt-oss reasoning model returns empty content on long prompts
+      # (observed: three ~1 s "Empty response" attempts, then the
+      # "LLM not available" fallback document). Use the Mistral-family
+      # placeholder alias served by LiteLLM (Devstral 2).
+      MISTRAL_MODEL: "<LLM_MODEL>"
+      # Code appends /v1/chat/completions to GUARDRAILS_API_URL.
+      GUARDRAILS_API_URL: "${litellm_base}"
+      SUBSUMTION_API_URL: "http://subsumtion-service.${app_namespace}.svc.cluster.local"
+      TEX2PDF_API_URL: "http://tex2pdf-service.${app_namespace}.svc.cluster.local"
+      SCORE_API_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
+      DISABLE_TRACING: "true"
+
+  dokumentenaufbereitung-data-service:
+    enabled: true
+    env:
+      DATABASE_HOST: "${rds_host}"
+      DATABASE_PORT: "${rds_port}"
+      DATABASE_NAME: dokumentenaufbereitung
+      DATABASE_POSTGRES_SCHEMA: public
+      DATABASE_USERNAME: { secret: { name: rds-app, key: username } }
+      DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      AI_API_URL: "${litellm_url}"
+      AI_API_KEY: { secret: { name: litellm, key: master_key } }
+      OBJECT_STORAGE_BUCKET_NAME: "${s3_bucket}"
+      OBJECT_STORAGE_URL: "${s3_endpoint}"
+      OBJECT_STORAGE_REGION_NAME: "${s3_region}"
+      OBJECT_STORAGE_ACCESS_KEY: { secret: { name: s3-app, key: access_key_id } }
+      OBJECT_STORAGE_SECRET_KEY: { secret: { name: s3-app, key: secret_access_key } }
+      CORS_ALLOW_ORIGIN_REGEX: ".*"
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_AUDIT_ENABLED: "false"
+      BIZLOG_AUDIT_SIGNING_KEY: ""
+      BIZLOG_AUDIT_ENDPOINT: ""
+      BIZLOG_EVENT_VERSION: "0.1.0"
+      SERVICE_ENVIRONMENT: demo
+      SERVICE_NAME: dokumentenaufbereitung-data-service
+      SERVICE_VERSION: "${image_tag}"
+
+  dokumentenaufbereitung-monorepo:
+    enabled: true
+    resources:
+      requests: { cpu: 500m, memory: 2Gi }
+      limits: { cpu: "2", memory: 6Gi }
+    env:
+      DATABASE_HOST: "${rds_host}"
+      DATABASE_PORT: "${rds_port}"
+      DATABASE_NAME: dokumentenaufbereitung
+      DATABASE_POSTGRES_SCHEMA: public
+      DATABASE_USERNAME: { secret: { name: rds-app, key: username } }
+      DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      INFERENCE_AI_API_KEY: { secret: { name: litellm, key: master_key } }
+      INFERENCE_AI_INFERENCE_API_URL: "${litellm_url}"
+      INFERENCE_AI_FALLBACK_INFERENCE_API_URL: "${litellm_url}"
+      # Pharia Document Index: proprietary SaaS, not part of the demo —
+      # placeholders keep the AppConfig satisfied (documented gap).
+      INFERENCE_AI_DOCUMENT_INDEX_API_URL: "http://localhost:9"
+      INFERENCE_AI_DOCUMENT_INDEX: demo-placeholder
+      INFERENCE_AI_DOCUMENT_NAMESPACE: demo
+      NER_MODULE_API: "http://ner-extraction.${app_namespace}.svc.cluster.local"
+      RECHTSQUELLENVORBEREITUNG_MODULE_API: "http://rechtsquellenvorbereitung.${app_namespace}.svc.cluster.local"
+      DOKUMENTENAUFBEREITUNG_DATA_SERVICE_URL: "http://dokumentenaufbereitung-data-service.${app_namespace}.svc.cluster.local"
+      OBJECT_STORAGE_BUCKET_NAME: "${s3_bucket}"
+      OBJECT_STORAGE_URL: "${s3_endpoint}"
+      OBJECT_STORAGE_REGION_NAME: "${s3_region}"
+      OBJECT_STORAGE_ACCESS_KEY: { secret: { name: s3-app, key: access_key_id } }
+      OBJECT_STORAGE_SECRET_KEY: { secret: { name: s3-app, key: secret_access_key } }
+      LOCAL_AI_MODELS_USAGE: "false"
+      LOCAL_AI_MODELS_BASEPATH: /tmp/models
+      CONCURRENT_BATCH_LIMIT: "2"
+      DOCUMENT_KEY_BASE: documents
+      DOCLING_SERVICE_MODEL: "${chat_model}"
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_AUDIT_ENABLED: "false"
+      BIZLOG_AUDIT_SIGNING_KEY: ""
+      BIZLOG_AUDIT_ENDPOINT: ""
+      BIZLOG_EVENT_VERSION: "0.1.0"
+      SERVICE_ENVIRONMENT: demo
+      SERVICE_NAME: dokumentenaufbereitung-monorepo
+      SERVICE_VERSION: "${image_tag}"
+
+  dokumentenpruefung:
+    enabled: true
+    env:
+      APP_ENV: dev
+      DATABASE_TYPE: postgres
+      DATABASE_HOST: "${rds_host}"
+      DATABASE_PORT: "${rds_port}"
+      DATABASE_DB: dokumentenpruefung
+      DATABASE_USER: { secret: { name: rds-app, key: username } }
+      DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
+      REGISTRY_RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      REGISTRY_RABBITMQ_QUEUE_NAME: dokumentenpruefung
+      LLM_ENDPOINT: "${litellm_url}"
+      LLM_FALLBACK_ENDPOINT: "${litellm_url}"
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      LLM_DEFAULT_MODEL: "${chat_model}"
+      EMBEDDING_ENDPOINT: "${litellm_url}"
+      EMBEDDING_FALLBACK_ENDPOINT: "${litellm_url}"
+      EMBEDDING_API_KEY: { secret: { name: litellm, key: master_key } }
+      EMBEDDING_DEFAULT_MODEL: "${embedding_model}"
+      KI_GUV_FEEDBACK_API: "http://ki-guv-feedback.${app_namespace}.svc.cluster.local"
+      BIZLOG_FALLBACK_ONLY: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      KI_GUV_EXPLAINABILITY_API_BASE_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
+      DOKUMENTENAUFBEREITUNG_DATA_SERVICE_URL: "http://dokumentenaufbereitung-data-service.${app_namespace}.svc.cluster.local"
+      DOKUMENTENAUFBEREITUNG_MONOREPO_URL: "http://dokumentenaufbereitung-monorepo.${app_namespace}.svc.cluster.local"
+      NODE_IP: { fieldRef: status.hostIP }
+
+  dokumentenschwaerzung-orchestrator:
+    enabled: true
+    env:
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      QUEUE_PII_DETECTION_REQUEST: dokumentenschwaerzung-pii-detection-request
+      QUEUE_PII_DETECTION_RESPONSE: dokumentenschwaerzung-pii-detection-response
+      QUEUE_PDF_REDACTION_REQUEST: dokumentenschwaerzung-pdf-redaction-request
+      QUEUE_PDF_REDACTION_RESPONSE: dokumentenschwaerzung-pdf-redaction-response
+      OBJECT_STORAGE_BUCKET_NAME: "${s3_bucket}"
+      OBJECT_STORAGE_URL: "${s3_endpoint}"
+      OBJECT_STORAGE_REGION_NAME: "${s3_region}"
+      OBJECT_STORAGE_ACCESS_KEY: { secret: { name: s3-app, key: access_key_id } }
+      OBJECT_STORAGE_SECRET_KEY: { secret: { name: s3-app, key: secret_access_key } }
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_AUDIT_ENABLED: "false"
+      SERVICE_ENVIRONMENT: demo
+      SERVICE_NAME: dokumentenschwaerzung-orchestrator
+      SERVICE_VERSION: "${image_tag}"
+
+  dokumentenschwaerzung-pdf-pii-detector:
+    enabled: true
+    env:
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      QUEUE_PII_DETECTION_REQUEST: dokumentenschwaerzung-pii-detection-request
+      QUEUE_PII_DETECTION_RESPONSE: dokumentenschwaerzung-pii-detection-response
+      QUEUE_PDF_REDACTION_REQUEST: dokumentenschwaerzung-pdf-redaction-request
+      QUEUE_PDF_REDACTION_RESPONSE: dokumentenschwaerzung-pdf-redaction-response
+      AI_MODEL_NAME: "${chat_model}"
+      NER_MODULE_API: "http://ner-extraction.${app_namespace}.svc.cluster.local"
+      ORCHESTRATOR_MODULE_API: "http://dokumentenschwaerzung-orchestrator.${app_namespace}.svc.cluster.local"
+      DATA_SERVICE_MODULE_API: "http://dokumentenaufbereitung-data-service.${app_namespace}.svc.cluster.local"
+      OBJECT_STORAGE_BUCKET_NAME: "${s3_bucket}"
+      OBJECT_STORAGE_URL: "${s3_endpoint}"
+      OBJECT_STORAGE_REGION_NAME: "${s3_region}"
+      OBJECT_STORAGE_ACCESS_KEY: { secret: { name: s3-app, key: access_key_id } }
+      OBJECT_STORAGE_SECRET_KEY: { secret: { name: s3-app, key: secret_access_key } }
+      SERVICE_ENVIRONMENT: demo
+      SERVICE_NAME: dokumentenschwaerzung-pdf-pii-detector
+      SERVICE_VERSION: "${image_tag}"
+
+  dokumentensuche:
+    enabled: true
+    env:
+      BMDS_LLM_ENDPOINT: "${litellm_url}"
+      BMDS_LLM_DEFAULT_MODEL: "${chat_model}"
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      DATA_SERVICE_URL: "http://dokumentenaufbereitung-data-service.${app_namespace}.svc.cluster.local"
+      VECTOR_DB_NAMESPACE: demo
+      VECTOR_DB_INDEX: demo-index
+      ALLOW_ORIGIN_REGEX: ".*"
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_AUDIT_ENABLED: "false"
+      SERVICE_ENVIRONMENT: demo
+      SERVICE_NAME: dokumentensuche
+      SERVICE_VERSION: "${image_tag}"
+
+  fristenmanagement:
+    enabled: true
+    env:
+      APP_ENV: dev
+      BMDS_DATABASE_HOST: "${rds_host}"
+      BMDS_DATABASE_PORT: "${rds_port}"
+      BMDS_DATABASE_DB: fristenmanagement
+      BMDS_DATABASE_USER: { secret: { name: rds-app, key: username } }
+      BMDS_DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
+      BMDS_LLM_ENDPOINT: "${litellm_url}"
+      BMDS_LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      BMDS_LLM_DEFAULT_MODEL: "${chat_model}"
+      BMDS_EMBEDDING_ENDPOINT: "${litellm_url}"
+      BMDS_EMBEDDING_API_KEY: { secret: { name: litellm, key: master_key } }
+      BMDS_EMBEDDING_DEFAULT_MODEL: "${embedding_model}"
+      BMDS_QDRANT_HOST: "qdrant.${platform_namespace}.svc.cluster.local"
+      BMDS_QDRANT_PORT: "6333"
+      BMDS_QDRANT_API_KEY: ""
+      KI_GUV_FEEDBACK_API: "http://ki-guv-feedback.${app_namespace}.svc.cluster.local"
+      NODE_IP: { fieldRef: status.hostIP }
+
+  graph-api:
+    enabled: true
+    env:
+      NEO4J_URL: "bolt://neo4j.${platform_namespace}.svc.cluster.local:7687"
+      NEO4J_USER: { secret: { name: neo4j, key: username } }
+      NEO4J_PASSWORD: { secret: { name: neo4j, key: password } }
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      LLM_API_URL: "${litellm_url}"
+      LLM_API_FALLBACK_URL: "${litellm_url}"
+      LLM_EMBEDDING_MODEL: "${embedding_model}"
+      VECTOR_DIMENSIONS: "1024"
+      RERANKER_BASE_URL: "http://localhost:9"
+      RERANKER_API_KEY: demo-placeholder
+      RERANKER_MODEL: demo-placeholder
+      TRACING_ENABLED: "false"
+
+  ki-guv-ai-testing:
+    enabled: true
+    env:
+      POSTGRES_HOST: "${rds_host}"
+      POSTGRES_PORT: "${rds_port}"
+      POSTGRES_DB: ki_guv_ai_testing
+      POSTGRES_USER: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      CORS_ORIGIN_REGEX: ".*"
+
+  ki-guv-explainability:
+    enabled: true
+    env:
+      APP_ENV: dev
+      POSTGRES_HOST: "${rds_host}"
+      POSTGRES_PORT: "${rds_port}"
+      POSTGRES_DB: ki_guv_explainability
+      POSTGRES_USERNAME: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      PHARIA_AI_API_KEY: { secret: { name: litellm, key: master_key } }
+      PHARIA_AI_API_URL: "${litellm_url}"
+      PHARIA_AI_API_URL_FALLBACK: "${litellm_url}"
+      MISTRAL_MODEL: "${chat_model}"
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      CORS_ALLOW_ORIGIN_REGEX: ".*"
+      NODE_IP: { fieldRef: status.hostIP }
+      TRACING_ENABLED: "false"
+
+  ki-guv-feedback:
+    # DISABLED (documented functional gap, upstream-issue candidate): the
+    # config validates at startup that the feedback-clustering .pkl model
+    # files exist on disk, but the published sources ship no model files
+    # and the image build cannot produce them (observed: pydantic
+    # "Model filepath ... does not exist"). Consumers (dokumentenpruefung,
+    # fristenmanagement) degrade gracefully — feedback calls fail soft.
+    enabled: false
+    env:
+      APP_ENV: dev
+      POSTGRES_HOST: "${rds_host}"
+      POSTGRES_PORT: "${rds_port}"
+      POSTGRES_DB: ki_guv_feedback
+      POSTGRES_USERNAME: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      XT_SERVICE_BASE_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
+      PARTIAL_SUBSUMPTION_SCORE_API_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
+      OVERALL_SUBSUMPTION_SCORE_API_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
+      # Clustering model files: upstream requires the paths to EXIST at
+      # startup. Whether the image bundles them is a known open question —
+      # if the pod crashloops on this, disable the service and document.
+      PARTIAL_SUBSUMPTION_OPTIONAL_FEEDBACK_CLUSTERING_MODEL_FILEPATH: /app/models/partial.pkl
+      OVERALL_SUBSUMPTION_OPTIONAL_FEEDBACK_CLUSTERING_MODEL_FILEPATH: /app/models/overall.pkl
+      MODEL_FILE_HMAC_SECRET: demo-placeholder
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      CORS_ORIGIN_REGEX: ".*"
+      NODE_IP: { fieldRef: status.hostIP }
+      TRACING_ENABLED: "false"
+
+  kommentar-service:
+    enabled: true
+    env:
+      APP_ENV: dev
+      # The image starts via `uv run` as a non-root user without HOME —
+      # uv cannot create /.cache/uv (observed: Permission denied).
+      UV_CACHE_DIR: /tmp/uv-cache
+      POSTGRE_HOST: "${rds_host}"
+      POSTGRE_PORT: "${rds_port}"
+      POSTGRE_DBNAME: kommentar_service
+      POSTGRE_USER: { secret: { name: rds-app, key: username } }
+      POSTGRE_PASSWORD: { secret: { name: rds-app, key: password } }
+      SCHEMA_NAME: core
+      SERVICE_NAME: kommentar-service
+      SERVICE_VERSION: "${image_tag}"
+      CORS_ALLOW_ORIGIN_REGEX: ".*"
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+
+  nachforderungen:
+    enabled: true
+    env:
+      APP_ENV: dev
+      DATABASE_TYPE: postgres
+      DATABASE_HOST: "${rds_host}"
+      DATABASE_PORT: "${rds_port}"
+      DATABASE_DB: nachforderungen
+      DATABASE_USER: { secret: { name: rds-app, key: username } }
+      DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
+      SERVICE_NAME: nachforderungen
+      SERVICE_VERSION: "${image_tag}"
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_AUDIT_ENABLED: "false"
+      # Non-empty: bizlog raises "Audit-safe logging requires a signing
+      # key" here even with audit disabled (observed).
+      BIZLOG_AUDIT_SIGNING_KEY: demo-placeholder
+      BIZLOG_AUDIT_ENDPOINT: ""
+
+  ner-extraction:
+    enabled: true
+    env:
+      LLM_API_URL: "${litellm_url}"
+      LLM_FALLBACK_API_URL: "${litellm_url}"
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      LLM_MODEL_NAME: "${chat_model}"
+
+  norm-matching:
+    enabled: true
+    env:
+      APP_ENV: dev
+      POSTGRES_BASE_URL: "${rds_host}:${rds_port}/norm_matching"
+      POSTGRES_USER: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      LLM_PROVIDER: pharia
+      LLM_MODEL: "${chat_model}"
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      LLM_API_URL: "${litellm_url}"
+      LLM_API_FALLBACK_URL: "${litellm_url}"
+      # norm-matching reads /documents/{id}/chunkmetadata and
+      # /proposals/{id}/documents — data-service routes, not monorepo.
+      DOCUMENT_API_BASE_URL: "http://dokumentenaufbereitung-data-service.${app_namespace}.svc.cluster.local"
+      GRAPH_DB_API_BASE_URL: "http://graph-api.${app_namespace}.svc.cluster.local"
+      RERANKER_BASE_URL: "http://localhost:9"
+      RERANKER_API_KEY: demo-placeholder
+      RERANKER_MODEL: demo-placeholder
+      DOCUMENT_INDEX_API_KEY: demo-placeholder
+      DOCUMENT_INDEX_API_URL: "http://localhost:9"
+      DOCUMENT_INDEX_NAMESPACE: Studio
+      BIZLOG_FALLBACK_ONLY: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      NODE_IP: { fieldRef: status.hostIP }
+      TRACING_ENABLED: "false"
+
+  rechtsquellenvorbereitung:
+    # DISABLED (documented functional gap, upstream-issue candidate): the
+    # service code imports the mistralai 1.x API (mistralai.utils.
+    # BackoffStrategy) while the shared lib bmds-ki-validierung forces
+    # mistralai>=2.0 into the lock — the import crashes at startup
+    # (observed: ModuleNotFoundError mistralai.utils). Upstream's private
+    # index presumably pins a compatible pair; with public PyPI resolution
+    # the conflict is unsolvable without patching upstream code.
+    enabled: false
+    env:
+      APP_ENV: dev
+      LLM_PROVIDER: pharia
+      LLM_MODEL: "${chat_model}"
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      LLM_API_URL: "${litellm_url}"
+      LLM_API_FALLBACK_URL: "${litellm_url}"
+      LLM_EMBEDDING_MODEL: "${embedding_model}"
+      LLM_EMBEDDING_DIM: "1024"
+      GRAPH_API_BASE_URL: "http://graph-api.${app_namespace}.svc.cluster.local"
+      NODE_IP: { fieldRef: status.hostIP }
+      TRACING_ENABLED: "false"
+
+  request-proxy:
+    enabled: true
+    # AMQP_URL must be set (without it the consumer defaults to localhost
+    # and crashes with Connection refused); the scaffolding "test.queue" it
+    # consumes is declared by the platform chart's rabbitmq-init job.
+    env:
+      AMQP_URL: { secret: { name: rabbitmq, key: url } }
+      PHARIA_BASE_URL: "${litellm_base}"
+      SERVICE_NAME: request-proxy
+      SERVICE_VERSION: "${image_tag}"
+      ENVIRONMENT: demo
+      NODE_IP: { fieldRef: status.hostIP }
+
+  risikohinweis-service:
+    enabled: true
+    env:
+      APP_ENV: dev
+      POSTGRES_BASE_URL: "${rds_host}:${rds_port}"
+      POSTGRES_DB: risikohinweis
+      POSTGRES_USER: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      LLM_PROVIDER: pharia
+      LLM_MODEL: "${chat_model}"
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      LLM_API_URL: "${litellm_url}"
+      LLM_API_FALLBACK_URL: "${litellm_url}"
+      GRAPH_DB_API_BASE_URL: "http://graph-api.${app_namespace}.svc.cluster.local"
+      ENABLE_GRAPH_DB_LOOKUP: "false"
+      RERANKER_BASE_URL: "http://localhost:9"
+      RERANKER_API_KEY: demo-placeholder
+      RERANKER_MODEL: demo-placeholder
+      BIZLOG_FALLBACK_ONLY: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      NODE_IP: { fieldRef: status.hostIP }
+      TRACING_ENABLED: "false"
+
+  subsumtion-service:
+    enabled: true
+    env:
+      APP_ENV: dev
+      POSTGRES_BASE_URL: "${rds_host}:${rds_port}/subsumtion"
+      POSTGRES_USER: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      LLM_PROVIDER: pharia
+      LLM_MODEL: "${chat_model}"
+      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
+      LLM_API_URL: "${litellm_url}"
+      LLM_API_FALLBACK_URL: "${litellm_url}"
+      NORM_MATCHING_BASE_URL: "http://norm-matching.${app_namespace}.svc.cluster.local"
+      EXPLAINABILITY_TRANSPARENCY_BASE_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
+      RISIKOHINWEIS_BASE_URL: "http://risikohinweis-service.${app_namespace}.svc.cluster.local"
+      BIZLOG_FALLBACK_ONLY: "true"
+      # AuditSafeLogger refuses to construct without a signing key even in
+      # fallback mode (observed: kommentar-service crashloop "Audit-safe
+      # logging requires a signing key" at import time).
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      NODE_IP: { fieldRef: status.hostIP }
+      TRACING_ENABLED: "false"
+
+  tex2pdf-service:
+    enabled: true
+    env:
+      ENVIRONMENT: development
+      OBJECT_STORAGE_TYPE: s3
+      OBJECT_STORAGE_URL: "${s3_endpoint}"
+      OBJECT_STORAGE_ACCESS_KEY: { secret: { name: s3-app, key: access_key_id } }
+      OBJECT_STORAGE_SECRET_KEY: { secret: { name: s3-app, key: secret_access_key } }
+      OBJECT_STORAGE_BUCKET_NAME: "${s3_bucket}"
+      OBJECT_STORAGE_REGION_NAME: "${s3_region}"
+      BERICHTSKONFIGURATOR_URL: "http://berichtskonfigurator.${app_namespace}.svc.cluster.local"
+      ALLOWED_ORIGIN_REGEX: ".*"
+      ENABLE_TRACING: "false"
+
+  xoev-adapter:
+    enabled: true
+    # The scaffolding "test.queue" both adapters consume is declared by the
+    # platform chart's rabbitmq-init job (observed crash without it).
+    env:
+      AMQP_URL: { secret: { name: rabbitmq, key: url } }
+
+  frontend:
+    enabled: true
+    port: 8080
+    healthPath: /
+    env:
+      # window.ENV runtime config (docker-entrypoint.sh). Same-origin API
+      # paths through the consolidated ingress — no CORS needed.
+      WHICH_ENV: demo
+      IS_TEST_ENV: "false"
+      RETURN_MOCK_CONFIG: "false"
+      USE_SIMPLE_PANEL: "false"
+      AUTH_TOKEN: ""
+      NACHFORDERUNGEN_API_URL: "https://${api_host}/api/nachforderungen"
+      DOKUMENTPRUEFUNG_API_URL: "https://${api_host}/api/dokumentenpruefung"
+      VP_API_URL: "https://${api_host}/api/dokumentenpruefung"
+      NEBENBESTIMMUNGEN_API_URL: "https://${api_host}/api/berichtskonfigurator"
+      FEEDBACK_API_URL: "https://${api_host}/api/ki-guv-feedback"
+      COMMENTS_API_URL: "https://${api_host}/api/kommentar-service"
+      FRISTEN_API_URL: "https://${api_host}/api/fristenmanagement"
+      SCORE_API_URL: "https://${api_host}/api/ki-guv-explainability"
+      BERCHITSCONFIG_API_URL: "https://${api_host}/api/berichtskonfigurator"
+      PROCEDURE_CONFIGURATOR_API_URL: "https://${api_host}/api/berichtskonfigurator"
+      TEX2PDF_API_URL: "https://${api_host}/api/tex2pdf-service"
+      NORM_MATCHING_API_URL: "https://${api_host}/api/norm-matching"
+      SUBSUMTION_API_URL: "https://${api_host}/api/subsumtion-service"
+      # DOKUMENT_API_URL serves /documents/{id}(/pdf|/confidence-scores) —
+      # these routes live on the DATA-SERVICE; DA_API_URL serves /document
+      # upload + /status/{proposal_id} — those live on the MONOREPO
+      # (observed: swapped mapping gave 404/405 in the redaction viewer,
+      # confidence-score and processing-status calls).
+      DOKUMENT_API_URL: "https://${api_host}/api/dokumentenaufbereitung-data-service"
+      DA_API_URL: "https://${api_host}/api/dokumentenaufbereitung-monorepo"
+      ORCHESTRATOR_API_URL: "https://${api_host}/api/dokumentenschwaerzung-orchestrator"
+      DS_API_URL: "https://${api_host}/api/dokumentenschwaerzung-orchestrator"
+      DOKUMENTENSUCHE_API_URL: "https://${api_host}/api/dokumentensuche"
+      TEST_API_URL: "https://${api_host}/api/ki-guv-ai-testing"
+      EXPLAINABILITY_API_URL: "https://${api_host}/api/ki-guv-explainability"
+      DEFINITION_RISK_ASSESSMENT_API_URL: "https://${api_host}/api/risikohinweis-service"
+      # MFEs ship inside the same monorepo image; the shell resolves them
+      # relative to these URLs (best-effort mapping, adjust after first boot).
+      MFE1_URL: "https://${api_host}/mfe1"
+      MFE_FP_URL: "https://${api_host}/mfe-fp"
+      MFE_WS_URL: "https://${api_host}/mfe-ws"
+      MFE_VERWALTUNGSAKT_URL: "https://${api_host}/mfe-verwaltungsakt"
+      MFE_MP_URL: "https://${api_host}/mfe-mp"
+      MFE_VP_URL: "https://${api_host}/mfe-vp"
+      MFE_RTE_URL: "https://${api_host}/mfe-rte"
+      MFE_KP_URL: "https://${api_host}/mfe-kp"
+      MFE_EM_URL: ""
+      # Iframe target for the Einwendungsmanagement sidebar entry. Upstream
+      # points this at the external demosplan platform (not shipped); an
+      # empty value rendered a broken frame. The demo-inspector serves a
+      # static explanation page instead. The literal substring 'antrag_id'
+      # is required — the shell substitutes it with the current Antrag UUID.
+      MFE_EM_DYNAMIC_URL: "https://${api_host}/demo-inspector/em-placeholder?antrag=antrag_id"
+      DASHBOARD_OVERVIEW_URL: ""
+      DASHBOARD_COMPLIANCE_URL: ""
+      DASHBOARD_QUALITY_URL: ""

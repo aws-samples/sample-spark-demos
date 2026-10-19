@@ -1,0 +1,30 @@
+# ESO: one cluster-wide store against AWS Secrets Manager (auth via the
+# controller's Pod Identity role).
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: {{ .Values.clusterSecretStore.name }}
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: {{ .Values.region }}
+---
+# cert-manager: Let's Encrypt via DNS-01 (Route53). TLS certificates for the
+# demo host are requested by the ingress-shim (cluster-issuer annotation on
+# the umbrella's Ingress).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.issuer.name }}
+spec:
+  acme:
+    server: {{ .Values.issuer.server }}
+    email: {{ .Values.acmeEmail }}
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: {{ .Values.region }}
+            hostedZoneID: {{ .Values.route53ZoneId }}

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: spark-api-cluster-config
+description: >
+  CRD-based cluster configuration for the SPARK API demo: ESO
+  ClusterSecretStore (AWS Secrets Manager) and cert-manager ClusterIssuer
+  (Let's Encrypt DNS-01 via Route53). Installed by the k8s-addons module
+  after the CRD-shipping controllers. Demo-grade, MIT-0.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

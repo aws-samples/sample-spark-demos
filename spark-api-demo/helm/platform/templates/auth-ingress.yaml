@@ -1,0 +1,82 @@
+{{- if .Values.auth.enabled }}
+# Public Keycloak host (login front-channel). TLS via cert-manager
+# ingress-shim, DNS record via external-dns. proxy-buffer-size raised:
+# Keycloak responses carry large headers/cookies that overflow the nginx
+# 4k default.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.auth.clusterIssuer }}
+    nginx.ingress.kubernetes.io/proxy-buffer-size: 16k
+    # The login front-channel has to be public, the ADMIN surface must not
+    # be (observed in an external security scan of the live demo:
+    # https://<auth-host>/realms/master/protocol/openid-connect/auth
+    # ?client_id=security-admin-console — the master realm's admin console
+    # was reachable from the internet, guarded only by the bootstrap admin
+    # password). Everything the demo needs lives in the `local` realm;
+    # admin access goes through `kubectl port-forward svc/keycloak 8080:80`
+    # instead. A bare `return` in an if-block is the documented-safe use of
+    # `if` in nginx and is evaluated before location matching, so it also
+    # covers paths the Ingress itself does not enumerate.
+    #
+    # Matched against $uri, NOT $request_uri: $uri is the normalized path
+    # (percent-decoded, `//` merged, dot segments resolved, no query
+    # string), so `/%61dmin/master`, `//admin/master` or
+    # `/x/../admin/master` cannot slip past the regex the way they would
+    # against the raw request line. scripts/verify.sh probes exactly these.
+    #
+    # Scope is deliberately `/admin/master` and NOT `/admin`: Keycloak
+    # serves the console for EVERY realm under /admin/master/console, while
+    # the token-protected admin REST API lives under /admin/realms/<realm>.
+    # Services do call that REST API through the public hostname (the
+    # workflow demo's identity-management-service does, via AUTH_BASE_URL),
+    # so a blanket /admin deny would break user management.
+    nginx.ingress.kubernetes.io/server-snippet: |
+      if ($uri ~* "^/(admin/master|realms/master)(/|$)") {
+        return 403;
+      }
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [{{ .Values.auth.host | quote }}]
+      secretName: keycloak-tls
+  rules:
+    - host: {{ .Values.auth.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port: { name: http }
+---
+# /oauth2/* on the API host -> oauth2-proxy (browser-facing: start,
+# callback, sign_in). Lives in the platform namespace next to its service
+# (Ingress backends are namespace-local); ingress-nginx merges same-host
+# rules across namespaces, TLS for the host is terminated by the umbrella
+# ingress's certificate. This path is the ONLY one on the host without the
+# external-auth annotations — everything else redirects here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ .Values.auth.apiHost | quote }}
+      http:
+        paths:
+          - path: /oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: oauth2-proxy
+                port: { name: http }
+{{- end }}

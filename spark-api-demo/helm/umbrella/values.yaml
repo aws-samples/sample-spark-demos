@@ -1,0 +1,35 @@
+# Structural defaults; the real wiring matrix is rendered by terraform
+# from helm/values/spark-api.demo.yaml.tftpl.
+global:
+  registry: ""
+  repositoryPrefix: spark-api-demo
+  tag: latest
+  defaultResources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }
+
+ingress:
+  host: example.invalid
+  clusterIssuer: letsencrypt
+  maxBodySize: 64m
+
+# OIDC perimeter via ingress-nginx external auth (oauth2-proxy lives in the
+# platform namespace; /oauth2 routing + Keycloak come from the platform
+# chart).
+auth:
+  enabled: true
+  platformNamespace: spark-api-platform
+
+# Demo inspector (MIT-0 demo tooling from this repo): browser overlay
+# showing live API calls + backend LLM/queue/Bedrock activity.
+inspector:
+  enabled: true
+  litellmBase: ""
+  rabbitmqMgmtUrl: ""
+  bedrockRegion: ""
+  tag: ""
+
+# services.<name>: { enabled, port, image, tag, replicas, healthPath,
+#   disableProbes, resources, env: { VAR: value | {secret:{name,key}} |
+#   {fieldRef: path} } }
+services: {}

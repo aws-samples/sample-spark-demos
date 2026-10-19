@@ -1,0 +1,143 @@
+# Values are populated by the terraform app-platform module (helm_release).
+# Placeholders here document the contract; never put real credentials in git.
+
+# Namespace the SPARK API application umbrella is installed into
+# (app-namespace ExternalSecrets).
+appNamespace: spark-api
+
+# ESO ClusterSecretStore created by the k8s-addons module.
+# checkov:skip=CKV_SECRET_6: Name of the ESO ClusterSecretStore, not a credential
+clusterSecretStore: aws-secrets-manager
+
+# AWS Secrets Manager entry names (outputs of the terraform secrets module).
+secretsManager:
+  rdsMaster: ""
+  rdsApp: ""
+  rabbitmq: ""
+  neo4j: ""
+  litellm: ""
+  bizlog: ""
+  keycloak: ""
+  oauth2Proxy: ""
+  s3App: ""
+
+# OSS auth perimeter (Keycloak + oauth2-proxy). SPARK API ships no auth —
+# upstream delegates it to the demosplan platform (outside demo scope v1).
+auth:
+  enabled: true
+  # Public Keycloak host and the protected API host (set by terraform).
+  host: ""
+  apiHost: ""
+  clusterIssuer: letsencrypt
+  realm: local
+  clientId: spark-api-demo
+  demoUser:
+    id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    firstName: "Spark"
+    lastName: "Demo"
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    resources:
+      requests: { cpu: 250m, memory: 1Gi }
+      limits: { cpu: "1", memory: 2Gi }
+  oauth2Proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
+
+rds:
+  host: ""
+  port: 5432
+
+# Whether the stateful workloads pin to the dedicated tainted pool.
+statefulPool: true
+
+rabbitmq:
+  image: public.ecr.aws/docker/library/rabbitmq:4.0-management
+  storage: 8Gi
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+neo4j:
+  image: public.ecr.aws/docker/library/neo4j:5-community
+  storage: 16Gi
+  resources:
+    requests: { cpu: 500m, memory: 2Gi }
+    limits: { cpu: "2", memory: 4Gi }
+
+qdrant:
+  image: docker.io/qdrant/qdrant:v1.15.5
+  storage: 16Gi
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { cpu: "1", memory: 2Gi }
+
+litellm:
+  image: ghcr.io/berriai/litellm:main-stable
+  serviceAccountName: litellm # pod identity association (bedrock access)
+  bedrockRegion: eu-central-1
+  bedrockModelId: openai.gpt-oss-120b-1:0
+  # Backing model for the upstream anonymization placeholder "<LLM_MODEL>"
+  # (dokumentenpruefung prompt registries force it per call). A Mistral
+  # model because the check pipelines use the Mistral SDK's structured
+  # output, which gpt-oss serves unreliably (observed: pydantic
+  # ValidationError "missing" on the synthesis step — the reasoning
+  # channel swallowed the JSON). Must be a model whose LiteLLM registry
+  # entry has supports_tool_choice AND supports_response_schema, or the
+  # json_schema enforcement degrades and models answer free-form/partial
+  # (observed: eu.mistral.pixtral-large — registry tool_choice false, a
+  # Bedrock limitation — returned markdown-fenced JSON; mistral-large-2402
+  # is no longer offered in eu-central-1; mistral.devstral-2-123b enforced
+  # the tool call but dropped required fields on fact-dense prompts —
+  # pydantic "missing" errors across the check pipelines). Claude Haiku
+  # 4.5 via the EU cross-region profile is registry-known for both flags
+  # and passes the Vollstaendigkeits-, Fakten- and Bescheid pipelines.
+  # Model weights are proprietary — accepted deviation for the demo, the
+  # open-weights default (gpt-oss-120b) stays the primary chat model.
+  #
+  # Not a model choice worth changing for the Plausibilitaetspruefung gap
+  # (README section F): Claude Sonnet 4.5 was deployed and produced the
+  # exact same failure, while the identical prompt + schema driven straight
+  # through LiteLLM answers schema-conformantly on Haiku. The defect is in
+  # the upstream client, not in the model — so stay on the cheaper one.
+  placeholderModelId: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+  # Model names exposed to the services (wired via env in the umbrella).
+  chatModelName: self-hosted/gpt-oss-120b
+  embeddingModelName: self-hosted/bge-m3
+  # DB mode (request log for the inspector) runs Prisma at startup —
+  # OOMKilled at the former 1Gi limit (observed: exit 137 after ~18s).
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { cpu: "1", memory: 2Gi }
+
+tei:
+  enabled: true
+  image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+  modelId: BAAI/bge-m3
+  # Commit of BAAI/bge-m3 on the Hugging Face Hub (model repo HEAD, 2024-07-03).
+  revision: 5617a9f61b028005a4858fdac845db406aefb181
+  # Verified in the spark-workflow demo: warmup OOMs at the 16384 default.
+  maxBatchTokens: 4096
+  resources:
+    requests: { cpu: "2", memory: 6Gi }
+    limits: { cpu: "4", memory: 16Gi }
+
+dbInit:
+  enabled: true
+  image: public.ecr.aws/docker/library/postgres:16
+  # One database per service that needs PostgreSQL (explicit names; the
+  # umbrella sets the matching env vars — never rely on upstream defaults).
+  databases:
+    - berichtskonfigurator
+    - dokumentenaufbereitung
+    - dokumentenpruefung
+    - fristenmanagement
+    - keycloak
+    - litellm
+    - ki_guv_ai_testing
+    - ki_guv_explainability
+    - ki_guv_feedback
+    - kommentar_service
+    - nachforderungen
+    - norm_matching
+    - risikohinweis
+    - subsumtion

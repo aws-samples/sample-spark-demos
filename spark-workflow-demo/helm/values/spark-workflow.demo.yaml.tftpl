@@ -1,0 +1,767 @@
+# =============================================================================
+# Demo overlay for the upstream 00-spark-workflow umbrella (rendered by
+# terraform templatefile() in the app-workflow module).
+#
+# Wiring targets:
+#   - RDS PostgreSQL:   ${rds_host}:${rds_port} (per-service DB_HOST/DB_PORT,
+#                       DB names = upstream umbrella defaults)
+#   - Amazon S3:        ${s3_endpoint} (dms/temporal/archival/quarantine buckets)
+#   - LiteLLM gateway:  ${litellm_url} (models: self-hosted/gpt-oss-120b via
+#                       Bedrock, self-hosted/bge-m3 via in-cluster TEI)
+#   - Keycloak:         https://${keycloak_host} (realm ${keycloak_realm})
+#   - docling-rq:       CPU image%{ if valkey_enabled }, broker = ElastiCache Valkey via
+#                       docling-rq-redis-url secret%{ endif }
+#
+# Secret names referenced here are created as ExternalSecrets by the
+# spark-platform chart (appSecrets) from AWS Secrets Manager.
+# =============================================================================
+
+global:
+  extraEnv:
+    - name: AUTH_AUDIENCE
+      value: "${keycloak_client_id}"
+    - name: AUTH_BASE_URL
+      value: "https://${keycloak_host}"
+    # Demo default: perimeter login via Envoy Gateway OIDC; service-level JWT
+    # enforcement disabled exactly like the upstream local stack. Documented
+    # deviation — switch to "strict" once token forwarding is verified.
+    - name: AUTH_MODE
+      value: "${auth_mode}"
+    - name: AUTH_ALLOWED_MACHINE_IDENTITIES
+      value: "spiffe://cluster.local/ns/*/sa/*"
+    - name: AUTH_REALM
+      value: "${keycloak_realm}"
+    - name: AUTH_SPICE_DB_ENDPOINT
+      value: "${release_name}-spicedb.${app_namespace}.svc.cluster.local:50051"
+    - name: AUTH_SPICE_DB_INSECURE
+      value: "true"
+    - name: AUTH_SPICE_DB_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: spicedb-config
+          key: preshared_key
+    - name: TEMPORAL_JOB_SERVICE_URL
+      value: '{{ printf "http://%s-temporal-job-service.%s.svc.cluster.local" .Release.Name .Release.Namespace }}'
+
+# ---------------------------------------------------------------------------
+# Layer 1 — Basisdienste
+# ---------------------------------------------------------------------------
+basisdienste:
+  enabled: true
+
+  spicedb:
+    cluster:
+      # No CNPG cluster: SpiceDB persists to Amazon RDS via the datastore_uri
+      # in the spicedb-config secret (ESO). The CNPG operator is not installed.
+      database:
+        enabled: false
+
+  clamav:
+    persistence:
+      # Chart default "" disables dynamic provisioning — bind to gp3.
+      storageClass: gp3
+
+  qdrant:
+    qdrant:
+      # Dedicated tainted node pool (terraform eks module).
+      nodeSelector:
+        spark-demo/pool: qdrant
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: qdrant
+          effect: NoSchedule
+      persistence:
+        storageClassName: gp3
+
+  docling-rq:
+    # Demo default: CPU mode (documented deviation; GPU via terraform flag).
+    image:
+      repository: "${docling_image}"
+      tag: "${docling_tag}"
+    worker:
+      replicaCount: 1
+      device: "${docling_device}"
+      resources:
+        requests:
+          cpu: "1"
+          memory: 6Gi
+        limits:
+          cpu: "4"
+          memory: 16Gi
+%{ if gpu_enabled ~}
+      nodeSelector:
+        spark-demo/pool: gpu
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+%{ else ~}
+      # null (not {}): Helm merges maps — only null removes the
+      # GKE GPU nodeSelector from the chart defaults.
+      nodeSelector: null
+      tolerations: []
+      extraEnv: []
+%{ endif ~}
+%{ if valkey_enabled ~}
+    # Amazon ElastiCache for Valkey replaces the embedded Redis container.
+    redis:
+      enabled: false
+    redisUrl:
+      secretName: docling-rq-redis-url
+      key: uri
+%{ endif ~}
+
+# ---------------------------------------------------------------------------
+# Layer 2 — Frontend
+# ---------------------------------------------------------------------------
+frontend-layer:
+  enabled: true
+  # Placeholder-only chart without a published image (v0.2.1) — out of scope.
+  landingpage:
+    enabled: false
+  frontend:
+    # Demo deviation (documented): the v0.2.1 image templates VITE_* into
+    # /usr/share/nginx/html at startup and binds port 80 — both require root
+    # in this image build. Upstream chart defaults (uid 65532) crash-loop.
+    podSecurityContext:
+      runAsNonRoot: false
+      runAsUser: 0
+      runAsGroup: 0
+      fsGroup: 0
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop: []
+        add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    extraEnv:
+      - name: VITE_API_BASE_URL
+        value: "/api"
+      - name: VITE_APP_BASE_PATH
+        value: "/app"
+      - name: VITE_ENABLE_EWMS_FEATURE
+        value: "true"
+      - name: VITE_ENABLE_MAINTENANCE_MODE
+        value: "false"
+      - name: VITE_SENTRY_DSN
+        value: ""
+      - name: VITE_SENTRY_ENVIRONMENT
+        value: "demo"
+      - name: VITE_TEMPORAL_UI_BASE_URL
+        value: "https://${temporal_host}/namespaces/default/workflows"
+      # SPA-side security allowlists for presigned S3 URLs: the frontend
+      # refuses to PUT/GET storage URLs whose origin is not listed here
+      # (uploadUrlSafety.ts/downloadUrlSafety.ts). Without these, every
+      # upload fails CLIENT-side before any request is sent (observed:
+      # "Hochladen fehlgeschlagen" while generate-upload-url succeeded and
+      # S3/CORS never saw a request).
+      - name: VITE_ALLOWED_UPLOAD_ORIGINS
+        value: "${s3_endpoint}"
+      - name: VITE_ALLOWED_DOWNLOAD_ORIGINS
+        value: "${s3_endpoint}"
+
+# ---------------------------------------------------------------------------
+# Layer 3 — Service Layer
+# ---------------------------------------------------------------------------
+service-layer:
+  enabled: true
+  project-logic-service:
+    extraEnv:
+    - name: DB_NAME
+      value: project_logic_service
+    - name: TEMPORAL__S3_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_ACCESS_KEY_ID
+    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_SECRET_ACCESS_KEY
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: PROJECT_LOGIC_SERVICE_CORS_ORIGINS
+      value: https://${frontend_host}
+    - name: TEMPORAL__S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL__S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL__S3_REGION
+      value: "${region}"
+  temporal-job-service:
+    extraEnv:
+    - name: DB__NAME
+      value: temporal_job_service
+    - name: DB__USER
+      valueFrom:
+        secretKeyRef:
+          name: temporal-job-service-db-user
+          key: username
+    - name: DB__PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: temporal-job-service-db-user
+          key: password
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: DB__HOST
+      value: "${rds_host}"
+    - name: TEMPORAL__S3_ARCHIVAL_BUCKET_NAME
+      value: "${bucket_archival}"
+    - name: TEMPORAL__S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL__S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL__S3_REGION
+      value: "${region}"
+    - name: TEMPORAL__S3_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_ACCESS_KEY_ID
+    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_SECRET_ACCESS_KEY
+  document-management-service:
+    extraEnv:
+    - name: DB_NAME
+      value: document_management_service
+    - name: TEMPORAL__S3_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_ACCESS_KEY_ID
+    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_SECRET_ACCESS_KEY
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: ENV
+      value: production
+    - name: BUCKET_NAME
+      value: "${bucket_dms}"
+    - name: CORS_ORIGINS
+      value: https://${frontend_host}
+    - name: QUARANTINE_BUCKET_NAME
+      value: "${bucket_quarantine}"
+    - name: QUARANTINE_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: S3_EXTERNAL_URL
+      value: "${s3_endpoint}"
+    - name: S3_REGION
+      value: "${region}"
+    - name: TEMPORAL__S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL__S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL__S3_REGION
+      value: "${region}"
+  agent-orchestration-service:
+    extraEnv:
+    - name: TEMPORAL__S3_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_ACCESS_KEY_ID
+    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: temporal-s3-secrets
+          key: TEMPORAL_S3_SECRET_ACCESS_KEY
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: CORS_ORIGINS
+      value: https://${frontend_host}
+    - name: TEMPORAL__S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL__S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL__S3_REGION
+      value: "${region}"
+  administrative-file-draft:
+    extraEnv:
+    - name: DB_NAME
+      value: administrative_file_draft
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+  comment-service:
+    extraEnv:
+    - name: DB_NAME
+      value: comment_service
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+  examination-service:
+    extraEnv:
+    - name: DB_NAME
+      value: examination_service
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: BACKEND_CORS_ORIGINS
+      value: https://${frontend_host}
+  feedback-service:
+    extraEnv:
+    - name: DB_NAME
+      value: feedback_service
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+  formal-completeness-check:
+    extraEnv:
+    - name: DB_NAME
+      value: formal_completeness_check
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: CORS_ORIGINS
+      value: https://${frontend_host}
+  fpp-service:
+    extraEnv:
+    - name: DB_NAME
+      value: fpp_service
+    - name: FPP_ALLOWED_DOMAINS
+      value: ''
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: BACKEND_CORS_ORIGINS
+      value: https://${frontend_host}
+  llm-client:
+    extraEnv:
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: LITELLM_BASE_URL
+      value: "${litellm_url}"
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  identity-management-service:
+    extraEnv:
+    - name: DB_NAME
+      value: identity_management_service
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: AUTH_BASE_URL
+      value: https://${keycloak_host}
+    - name: AUTH_PRIVILEGED_REALM
+      value: "${keycloak_realm}"
+    - name: AUTH_PRIVILEGED_CLIENT_ID
+      value: "${keycloak_client_id}"
+    # Admin-API client for GET /users (client_credentials). Without
+    # AUTH_CLIENT_ID the token request fails and /users returns 500 —
+    # the shared lib does not fall back to AUTH_AUDIENCE here.
+    - name: AUTH_CLIENT_ID
+      value: "${keycloak_client_id}"
+    - name: AUTH_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: keycloak-client
+          key: client_secret
+    - name: AUTH_PRIVILEGED_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: keycloak-client
+          key: client_secret
+  objections-management-service:
+    extraEnv:
+    - name: DB_NAME
+      value: objections_management_service
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+  plausibility-notes:
+    extraEnv:
+    - name: DB_NAME
+      value: plausibility_notes
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: CORS_ORIGINS
+      value: https://${frontend_host}
+  supplementary-requests-service:
+    extraEnv:
+    - name: DB_NAME
+      value: supplementary_requests_service
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: SUPPLEMENTARY_REQUESTS_SERVICE_CORS_ORIGINS
+      value: https://${frontend_host}
+  protocol-service:
+    extraEnv:
+    # The chart renders every per-source *_DB_HOST as an EMPTY env (no
+    # value, no secret ref); pydantic accepts "" and asyncpg then fails
+    # with OSError — readiness stays 503 forever, reported only for the
+    # first source checked (observed: pod 0/1 with "Database check failed
+    # for source 'project_logic'"). Point all sources at RDS explicitly.
+    - name: ADMINISTRATIVE_DRAFT_DB_HOST
+      value: "${rds_host}"
+    - name: COMMENT_DB_HOST
+      value: "${rds_host}"
+    - name: DOCUMENT_MANAGEMENT_DB_HOST
+      value: "${rds_host}"
+    - name: EXAMINATION_DB_HOST
+      value: "${rds_host}"
+    - name: FORMAL_COMPLETENESS_DB_HOST
+      value: "${rds_host}"
+    - name: OBJECTIONS_MANAGEMENT_DB_HOST
+      value: "${rds_host}"
+    - name: PLAUSIBILITY_DB_HOST
+      value: "${rds_host}"
+    - name: PROJECT_LOGIC_DB_HOST
+      value: "${rds_host}"
+    - name: SUPPLEMENTARY_DB_HOST
+      value: "${rds_host}"
+    - name: ADMINISTRATIVE_DRAFT_DB_NAME
+      value: administrative_file_draft
+    - name: COMMENT_DB_NAME
+      value: comment_service
+    - name: DOCUMENT_MANAGEMENT_DB_NAME
+      value: document_management_service
+    - name: EXAMINATION_DB_NAME
+      value: examination_service
+    - name: FORMAL_COMPLETENESS_DB_NAME
+      value: formal_completeness_check
+    - name: OBJECTIONS_MANAGEMENT_DB_NAME
+      value: objections_management_service
+    - name: PLAUSIBILITY_DB_NAME
+      value: plausibility_notes
+    - name: PROJECT_LOGIC_DB_NAME
+      value: project_logic_service
+    - name: SUPPLEMENTARY_DB_NAME
+      value: supplementary_requests_service
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: PROTOCOL_SERVICE_CORS_ORIGINS
+      value: https://${frontend_host}
+  rechtsaenderungs-monitoring:
+    extraEnv:
+    - name: DB_NAME
+      value: rechtsaenderungs_monitoring
+    - name: OTEL_ENDPOINT
+      value: ''
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  gesetze-normen-db-service:
+    extraEnv:
+    - name: DB_NAME
+      value: gesetze_normen
+    - name: OTEL_ENDPOINT
+      value: ''
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  jura-db-service:
+    extraEnv:
+    - name: CHUNKING_APIKEY
+      valueFrom:
+        secretKeyRef:
+          name: litellm-proxy-credentials
+          key: master-key
+    - name: DB_NAME
+      value: jura
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: CHUNKING_URL
+      value: "${litellm_url}"
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  gesetzesbegruendung-db-service:
+    extraEnv:
+    - name: CHUNKING_APIKEY
+      valueFrom:
+        secretKeyRef:
+          name: litellm-proxy-credentials
+          key: master-key
+    - name: DB_NAME
+      value: gesetzesbegruendung
+    - name: DOCLING_CLIENT_ID
+      valueFrom:
+        secretKeyRef:
+          name: docling-keycloak-secrets
+          key: KEYCLOAK_CLIENT_ID
+    - name: DOCLING_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: docling-keycloak-secrets
+          key: KEYCLOAK_CLIENT_SECRET
+    - name: DB_HOST
+      value: "${rds_host}"
+    - name: DB_PORT
+      value: "${rds_port}"
+    - name: CHUNKING_URL
+      value: "${litellm_url}"
+    # Service port 80 (targetPort 5001); port 5001 on the ClusterIP times out.
+    - name: DOCLING_HOST
+      value: '{{ printf "http://%s-docling-rq.%s.svc.cluster.local" .Release.Name .Release.Namespace }}'
+    - name: DOCLING_TOKEN_URL
+      value: https://${keycloak_host}/realms/${keycloak_realm}/protocol/openid-connect/token
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+# ---------------------------------------------------------------------------
+# Layer 4 — Orchestration (Temporal → RDS)
+# ---------------------------------------------------------------------------
+orchestration-layer:
+  enabled: true
+  temporal:
+    temporal:
+      # The wrapper disables schema management ("managed externally via
+      # CNPG"); on RDS the databases exist but are empty — enable the
+      # official chart's schema setup/update jobs. createDatabase stays off
+      # (databases are created by the platform db-init job with the right
+      # ownership).
+      schema:
+        createDatabase:
+          enabled: false
+        setup:
+          enabled: true
+        update:
+          enabled: true
+      web:
+        additionalEnv:
+          - name: TEMPORAL_CORS_ORIGINS
+            value: "https://${frontend_host}"
+      server:
+        config:
+          # Auto-create the "default" Temporal namespace (the wrapper leaves
+          # creation off; the search-attributes hook blocks until it exists).
+          namespaces:
+            create: true
+          persistence:
+            default:
+              sql:
+                host: "${rds_host}"
+                user: "spark_temporal"
+                existingSecret: "temporal-db-credentials"
+            visibility:
+              sql:
+                host: "${rds_host}"
+                user: "spark_temporal"
+                existingSecret: "temporal-db-credentials"
+
+# ---------------------------------------------------------------------------
+# Layer 5 — AI Modules
+# LiteLLM serves the exact model names the umbrella defaults reference
+# (self-hosted/gpt-oss-120b, self-hosted/bge-m3) — no per-module overrides.
+# ---------------------------------------------------------------------------
+ai-module-layer:
+  enabled: true
+  inhaltsextraktion:
+    extraEnv:
+    # The published v0.2.1 image sets TRANSFORMERS_OFFLINE=1 but does not
+    # contain the expected pre-baked model cache (upstream gap, issue to
+    # follow) — online mode allows the anonymous HF download at startup.
+    - name: TRANSFORMERS_OFFLINE
+      value: "0"
+    - name: HF_HUB_OFFLINE
+      value: "0"
+    # Non-root without HOME: the default cache "/.cache" is not writable.
+    - name: HF_HOME
+      value: /tmp/hf
+    - name: METADATA_MODEL_NAME
+      value: self-hosted/gpt-oss-120b
+    - name: SCHWERPUNKTTHEMA_MODEL_NAME
+      value: self-hosted/gpt-oss-120b
+    - name: STRUCTURE_MODEL_NAME
+      value: self-hosted/gpt-oss-120b
+    - name: SUMMARIZATION_MODEL_NAME
+      value: self-hosted/gpt-oss-120b
+    - name: VLM_SUMMARY_MODEL_NAME
+      value: self-hosted/gpt-oss-120b
+    # Deviation from the upstream default (self-hosted/gpt-oss-120b): the
+    # VLM stage sends image content blocks, gpt-oss-120b is text-only —
+    # observed: Bedrock 400 "This model doesn't support the image content
+    # block" on every element, vlm-batch-processing fails the document.
+    # Served by LiteLLM as a vision-capable Bedrock model (EU profile).
+    - name: VLLM_MODEL
+      value: "${vlm_model_name}"
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: LITELLM_BASE_URL
+      value: "${litellm_url}"
+    - name: INJECTION_MODEL_URL
+      value: 'http://localhost:9999/predict'
+    - name: KEYCLOAK_TOKEN_URL
+      value: https://${keycloak_host}/realms/${keycloak_realm}/protocol/openid-connect/token
+    - name: DOCLING_HOST
+      value: '{{ printf "%s-docling-rq.%s.svc.cluster.local" .Release.Name .Release.Namespace }}'
+    # Upstream default: Service port 80 (targetPort 5001). 5001 on the
+    # ClusterIP is not programmed by kube-proxy → ConnectTimeout on submit.
+    - name: DOCLING_PORT
+      value: '80'
+    - name: DOCLING_PROTOCOL
+      value: http
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  formale-vollstaendigkeitspruefung:
+    extraEnv:
+    - name: LITELLM_MODEL
+      value: self-hosted/gpt-oss-120b
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  plausibilitaetspruefung:
+    replicaCount: 2
+    extraEnv:
+    - name: LITELLM_MODEL
+      value: self-hosted/gpt-oss-120b
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  materielle-vollstaendigkeitspruefung:
+    extraEnv:
+    - name: LLM_DB_RESEARCH_MODEL
+      value: self-hosted/gpt-oss-120b
+    - name: LLM_EMBEDDING_MODEL
+      value: self-hosted/bge-m3
+    - name: LLM_PAGEINDEX_SVM_MODEL_STAGE1
+      value: self-hosted/gpt-oss-120b
+    - name: LLM_PAGEINDEX_SVM_MODEL_STAGE2
+      value: self-hosted/gpt-oss-120b
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  einwendungsmanagement:
+    extraEnv:
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  rechtliche-pruefung-und-bewertung:
+    extraEnv:
+    - name: LITELLM_MODEL
+      value: self-hosted/gpt-oss-120b
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  rechtsmethodik:
+    extraEnv:
+    - name: MODELS_LARGE_LLM
+      value: self-hosted/gpt-oss-120b
+    - name: MODELS_MEDIUM_LLM
+      value: self-hosted/gpt-oss-120b
+    - name: MODELS_SMALL_LLM
+      value: self-hosted/gpt-oss-120b
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  anonymisierung:
+    extraEnv:
+    - name: LLM_MODEL
+      value: self-hosted/gpt-oss-120b
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"
+    - name: TEMPORAL_S3_REGION
+      value: "${region}"
+  normenermittlung:
+    enabled: false
+  risikohinweiser:
+    extraEnv:
+    - name: OTEL_ENDPOINT
+      value: http://localhost:4317
+    - name: LITELLM_MODEL
+      value: self-hosted/gpt-oss-120b
+    - name: TEMPORAL_S3_BUCKET_NAME
+      value: "${bucket_temporal}"
+    - name: TEMPORAL_S3_ENDPOINT_URL
+      value: "${s3_endpoint}"

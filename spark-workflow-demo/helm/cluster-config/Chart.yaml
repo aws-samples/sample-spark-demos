@@ -1,0 +1,12 @@
+apiVersion: v2
+name: spark-cluster-config
+description: >
+  CRD-based cluster configuration for the SPARK Workflow demo: ESO
+  ClusterSecretStore, cert-manager ClusterIssuer + demo certificate, and the
+  Envoy Gateway (EnvoyProxy/GatewayClass/Gateway) behind an internet-facing
+  NLB. Installed via the Terraform helm provider AFTER the operator charts,
+  because the helm provider tolerates apply-time-unknown cluster credentials
+  (a kubectl-provider setup does not). MIT-0.
+type: application
+version: 0.1.4
+appVersion: "0.1.3"

@@ -1,0 +1,98 @@
+{{- if .Values.auth.enabled }}
+# oauth2-proxy in auth_request mode: ingress-nginx calls /oauth2/auth for
+# every request on the API host (auth-url annotation, in-cluster — never
+# through the NLB, see the hairpin lesson) and redirects browsers to
+# /oauth2/start. Front-channel URLs use the public Keycloak host; the
+# back-channel (redeem/JWKS/profile) stays in-cluster. Ported from the
+# spark-workflow-demo fallback template.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "spark-api-platform.selectorLabels" "oauth2-proxy" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-api-platform.selectorLabels" "oauth2-proxy" | nindent 8 }}
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: {{ .Values.auth.oauth2Proxy.image }}
+          env:
+            - name: OAUTH2_PROXY_HTTP_ADDRESS
+              value: 0.0.0.0:4180
+            # auth_request mode: nginx does the proxying, oauth2-proxy only
+            # authenticates. A static upstream answers anything that slips
+            # through directly.
+            - name: OAUTH2_PROXY_UPSTREAMS
+              value: static://202
+            - name: OAUTH2_PROXY_REVERSE_PROXY
+              value: "true"
+            - name: OAUTH2_PROXY_PROVIDER
+              value: keycloak-oidc
+            - name: OAUTH2_PROXY_CLIENT_ID
+              value: {{ .Values.auth.clientId }}
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: oauth2-proxy, key: client-secret } }
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom: { secretKeyRef: { name: oauth2-proxy, key: cookie-secret } }
+            - name: OAUTH2_PROXY_COOKIE_SECURE
+              value: "true"
+            # SPA behind auth_request: background XHRs of an already-open
+            # tab also get redirected into /oauth2/start and each one
+            # overwrites the single CSRF cookie — the user's interactive
+            # login then fails (observed in the browser: "Login Failed:
+            # Unable to find a valid CSRF token"; scripted single-flow
+            # logins never hit it). Per-request CSRF cookies keep parallel
+            # flows independent.
+            - name: OAUTH2_PROXY_COOKIE_CSRF_PER_REQUEST
+              value: "true"
+            - name: OAUTH2_PROXY_COOKIE_CSRF_EXPIRE
+              value: 15m
+            - name: OAUTH2_PROXY_EMAIL_DOMAINS
+              value: "*"
+            - name: OAUTH2_PROXY_REDIRECT_URL
+              value: https://{{ .Values.auth.apiHost }}/oauth2/callback
+            - name: OAUTH2_PROXY_SKIP_PROVIDER_BUTTON
+              value: "true"
+            - name: OAUTH2_PROXY_CODE_CHALLENGE_METHOD
+              value: S256
+            - name: OAUTH2_PROXY_SKIP_OIDC_DISCOVERY
+              value: "true"
+            - name: OAUTH2_PROXY_OIDC_ISSUER_URL
+              value: https://{{ .Values.auth.host }}/realms/{{ .Values.auth.realm }}
+            - name: OAUTH2_PROXY_LOGIN_URL
+              value: https://{{ .Values.auth.host }}/realms/{{ .Values.auth.realm }}/protocol/openid-connect/auth
+            - name: OAUTH2_PROXY_REDEEM_URL
+              value: http://keycloak.{{ .Release.Namespace }}.svc.cluster.local:8080/realms/{{ .Values.auth.realm }}/protocol/openid-connect/token
+            - name: OAUTH2_PROXY_OIDC_JWKS_URL
+              value: http://keycloak.{{ .Release.Namespace }}.svc.cluster.local:8080/realms/{{ .Values.auth.realm }}/protocol/openid-connect/certs
+            - name: OAUTH2_PROXY_PROFILE_URL
+              value: http://keycloak.{{ .Release.Namespace }}.svc.cluster.local:8080/realms/{{ .Values.auth.realm }}/protocol/openid-connect/userinfo
+            # Identity headers for the nginx auth-response-headers pass-through.
+            - name: OAUTH2_PROXY_SET_XAUTHREQUEST
+              value: "true"
+          ports:
+            - { name: http, containerPort: 4180 }
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-api-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-api-platform.selectorLabels" "oauth2-proxy" | nindent 4 }}
+  ports:
+    - { name: http, port: 4180, targetPort: http }
+{{- end }}
