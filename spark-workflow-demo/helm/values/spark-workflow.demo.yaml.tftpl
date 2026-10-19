@@ -121,6 +121,10 @@ frontend-layer:
   landingpage:
     enabled: false
   frontend:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     # Demo deviation (documented): the v0.2.1 image templates VITE_* into
     # /usr/share/nginx/html at startup and binds port 80 — both require root
     # in this image build. Upstream chart defaults (uid 65532) crash-loop.
@@ -231,6 +235,10 @@ service-layer:
           name: temporal-s3-secrets
           key: TEMPORAL_S3_SECRET_ACCESS_KEY
   document-management-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: document_management_service
@@ -273,6 +281,10 @@ service-layer:
     - name: TEMPORAL__S3_REGION
       value: "${region}"
   agent-orchestration-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: TEMPORAL__S3_ACCESS_KEY_ID
       valueFrom:
@@ -295,6 +307,10 @@ service-layer:
     - name: TEMPORAL__S3_REGION
       value: "${region}"
   administrative-file-draft:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: administrative_file_draft
@@ -303,6 +319,10 @@ service-layer:
     - name: DB_PORT
       value: "${rds_port}"
   comment-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: comment_service
@@ -311,6 +331,10 @@ service-layer:
     - name: DB_PORT
       value: "${rds_port}"
   examination-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: examination_service
@@ -321,6 +345,10 @@ service-layer:
     - name: BACKEND_CORS_ORIGINS
       value: https://${frontend_host}
   feedback-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: feedback_service
@@ -329,6 +357,10 @@ service-layer:
     - name: DB_PORT
       value: "${rds_port}"
   formal-completeness-check:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: formal_completeness_check
@@ -339,6 +371,10 @@ service-layer:
     - name: CORS_ORIGINS
       value: https://${frontend_host}
   fpp-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: fpp_service
@@ -363,6 +399,10 @@ service-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   identity-management-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: identity_management_service
@@ -392,6 +432,10 @@ service-layer:
           name: keycloak-client
           key: client_secret
   objections-management-service:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: objections_management_service
@@ -400,6 +444,10 @@ service-layer:
     - name: DB_PORT
       value: "${rds_port}"
   plausibility-notes:
+    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
+    # README section E for the per-service tag matrix.
+    image:
+      tag: "v0.2.3"
     extraEnv:
     - name: DB_NAME
       value: plausibility_notes

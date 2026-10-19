@@ -5,7 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning: [S
 
 ## [Unreleased]
 
+### Changed
+- Upstream submodule bumped from 06019d4 (v0.2.1+37) to the release tag **v0.2.3** (7829126, 2026-10-12). No change to the Helm charts, the Keycloak bootstrap, the frontend routing contract or the seed scripts between the two commits; the overlay only gains per-service image tags.
+- Overlay pins `image.tag: v0.2.3` for the 12 services with a published 0.2.3 image (frontend, document-management-service, agent-orchestration-service, administrative-file-draft, comment-service, examination-service, feedback-service, formal-completeness-check, fpp-service, identity-management-service, objections-management-service, plausibility-notes); the other 18 stay on the chart default `v0.2.1` because the registry publishes no 0.2.3 image for them (README section E, tag matrix). Static check: `helm template` through the postrenderer renders 105 resources unchanged apart from the tags.
+
 ### Security
+- Not covered by this bump (no published image): the upstream 0.2.3 fix for the PII redaction leak (issue #40, `modul-anonymisierung`) and the prompt-schema fix in `modul-formale-pruefung`; both modules stay on `v0.2.1` until the 0.3.0 re-integration. Recorded as THREAT-MODEL B-4.
 - Non-production disclaimer in the first screen of the README (and the root README), linking the threat model.
 - One customer-managed KMS key per environment (`terraform/modules/kms`, rotation on, 7-day deletion window) now encrypts every Secrets Manager entry, all four S3 buckets (SSE-KMS + Bucket Keys), ElastiCache Valkey at rest, RDS Performance Insights and the exported RDS log groups. The ESO pod identity is limited to `kms:Decrypt` on that key (`external_secrets_kms_key_arns`; the module default is every key in the account), the S3 IAM user receives the matching `kms:GenerateDataKey*`/`Decrypt` so presigned browser uploads keep working.
 - S3: versioning on every bucket plus a lifecycle rule (noncurrent versions and abandoned multipart uploads expire after 7 days).

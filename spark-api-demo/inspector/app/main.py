@@ -15,13 +15,18 @@ per SSE client (demo scale).
 import asyncio
 import datetime as dt
 import json
+import logging
 import os
 from typing import Any, AsyncGenerator
 
 import boto3
+import botocore.exceptions
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+log = logging.getLogger("demo-inspector")
 
 LITELLM_BASE = os.environ.get("LITELLM_BASE", "")
 LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
@@ -86,6 +91,61 @@ def em_placeholder(antrag: str = "") -> HTMLResponse:
 
 def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+def _public_error(exc: BaseException) -> str:
+    """Fixed-vocabulary error category for the browser.
+
+    The exception text itself never leaves the pod: httpx errors carry the
+    internal service URL, botocore errors carry the caller ARN and account
+    ID, and any traceback describes this process. The browser gets one of
+    the constant strings below; the real exception goes to the pod log
+    (see _report_source).
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timed out"
+    if isinstance(exc, httpx.TransportError):
+        return "unreachable"
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in (401, 403):
+            return "authentication failed"
+        if code >= 500:
+            return "upstream error"
+        return "request rejected"
+    if isinstance(exc, botocore.exceptions.ClientError):
+        if exc.response.get("Error", {}).get("Code") in (
+            "AccessDenied",
+            "AccessDeniedException",
+            "UnauthorizedOperation",
+            "ExpiredToken",
+            "ExpiredTokenException",
+        ):
+            return "access denied"
+        return "aws api error"
+    if isinstance(exc, botocore.exceptions.BotoCoreError):
+        return "aws client error"
+    return "unavailable"
+
+
+class _SourceState:
+    """Logs a source failure once per distinct failure (not on every 5 s
+    poll) and the recovery once, server-side only."""
+
+    def __init__(self) -> None:
+        self._failing: dict[str, str] = {}
+
+    def failed(self, source: str, exc: BaseException) -> dict[str, Any]:
+        category = _public_error(exc)
+        if self._failing.get(source) != category:
+            self._failing[source] = category
+            log.warning("source %s failed (%s): %r", source, category, exc, exc_info=exc)
+        return {"type": "source_error", "source": source, "message": category}
+
+    def recovered(self, source: str) -> None:
+        if source in self._failing:
+            del self._failing[source]
+            log.info("source %s recovered", source)
 
 
 async def _poll_litellm(client: httpx.AsyncClient, seen: set[str]) -> list[dict]:
@@ -198,6 +258,7 @@ def _poll_bedrock_sync() -> list[dict]:
 
 async def _event_stream() -> AsyncGenerator[str, None]:
     seen_llm: set[str] = set()
+    state = _SourceState()
     yield _sse({"type": "hello", "poll_seconds": POLL_SECONDS})
     async with httpx.AsyncClient() as client:
         while True:
@@ -208,13 +269,15 @@ async def _event_stream() -> AsyncGenerator[str, None]:
                 try:
                     for event in await coro:
                         yield _sse(event)
+                    state.recovered(name)
                 except Exception as exc:  # noqa: BLE001 — keep the stream alive
-                    yield _sse({"type": "source_error", "source": name, "message": str(exc)[:200]})
+                    yield _sse(state.failed(name, exc))
             try:
                 for event in await asyncio.to_thread(_poll_bedrock_sync):
                     yield _sse(event)
+                state.recovered("bedrock")
             except Exception as exc:  # noqa: BLE001
-                yield _sse({"type": "source_error", "source": "bedrock", "message": str(exc)[:200]})
+                yield _sse(state.failed("bedrock", exc))
             await asyncio.sleep(POLL_SECONDS)
 
 

@@ -275,6 +275,31 @@ occurred and forced the change.
 | Modules validate `OTEL_ENDPOINT` with `min_length=1`, the umbrella partly sets `""` | Upstream local convention `http://localhost:4317` (the exporter degrades silently); a real collector = phase 2 |
 | The SPA ships client-side origin allowlists for presigned storage URLs (`VITE_ALLOWED_UPLOAD_ORIGINS`, `VITE_ALLOWED_DOWNLOAD_ORIGINS`) that default to empty | Both set to the regional S3 endpoint in the frontend values — with an empty allowlist the SPA blocks every upload/download client-side before any request is sent (observed: "Hochladen fehlgeschlagen" although presigned URL generation succeeded and S3 never saw a request) |
 
+#### Image tags per service (submodule at v0.2.3)
+
+The submodule is pinned to the upstream release tag **v0.2.3**
+(2026-10-12), the last release before the 0.3.0 restructuring. Between our
+previous pin and v0.2.3 nothing in the Helm charts, the Keycloak bootstrap
+script, the frontend routing contract or the seed scripts changed (the
+chart tree is byte-identical), so the overlay below is unchanged apart from
+image tags. The upstream charts still default every image to `v0.2.1`
+(the 0.2.3 changelog says otherwise; upstream-issue candidate), and the
+openCode registry only publishes a `v0.2.3` image for part of the
+services. The overlay therefore pins per service:
+
+| Image tag | Services | Note |
+|---|---|---|
+| **v0.2.3** (12) | frontend, document-management-service, agent-orchestration-service, administrative-file-draft, comment-service, examination-service, feedback-service, formal-completeness-check, fpp-service, identity-management-service, objections-management-service, plausibility-notes | Carries the 0.2.3 fixes we care about: document management signs internal upload URLs with `S3_ENDPOINT_URL` (we set `S3_ENDPOINT_URL` and `S3_EXTERNAL_URL` to the same regional endpoint, nothing to change) and the CVE dependency bumps. Python services now run on the ZenDiS hardened `python3:3.13-minimal` base; the venv stays on `PATH`, so the seed runner's `kubectl exec … python -m src.scripts.seed_data` keeps working |
+| v0.2.1 (18) | project-logic-service, protocol-service, supplementary-requests-service, temporal-job-service, all `modul-*`, llm-client, gesetze-normen-/gesetzesbegruendung-/jura-db-service, rechtsaenderungs-monitoring | No `v0.2.3` image published; the next tag is `v0.3.0` from the restructured tree, which does not fit the 0.2.x charts. Consequence: the 0.2.3 **security fix for PII redaction (upstream issue #40, `modul-anonymisierung`)** and the prompt-schema fix (`modul-formale-pruefung`) are **not** in this deployment — see `../docs/THREAT-MODEL.md` B-4 |
+| none | landingpage, normenermittlung | Still no published image (disabled, section D) |
+
+Within the 0.2.x line there is no API-contract change between the two
+tags, so the mixed set is uncritical. Verified statically (`helm template`
+of the staged charts with this overlay through the postrenderer: 105
+resources, the postrenderer removes exactly the three expected lines, 12 ×
+`v0.2.3` / 18 × `v0.2.1` image references); the live roll-out happens with
+the next `make apply`.
+
 ### F. Data protection and hardening defaults (deployment layer)
 
 Added after a static review (checkov + semgrep over this repo's Terraform,
