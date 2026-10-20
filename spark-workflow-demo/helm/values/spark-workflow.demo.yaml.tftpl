@@ -199,6 +199,13 @@ service-layer:
     - name: TEMPORAL__S3_REGION
       value: "${region}"
   temporal-job-service:
+    # Chart default startupProbe allows 60 s (6 x 10 s); at cold start the
+    # alembic migration plus the Temporal connect take about that long under
+    # the 150m CPU limit (observed: both replicas killed by the startup probe
+    # 5-6 times, "connection refused" on /startup, uvicorn up right when the
+    # SIGTERM arrived; Ready after 7 min). Map merge keeps the chart's httpGet.
+    startupProbe:
+      failureThreshold: 30
     extraEnv:
     - name: DB__NAME
       value: temporal_job_service
@@ -387,6 +394,19 @@ service-layer:
     - name: BACKEND_CORS_ORIGINS
       value: https://${frontend_host}
   llm-client:
+    # Temporal worker for the llm-custom queue (every Bedrock call); same
+    # silent cold-start death as the AI modules — see ai-module-layer below.
+    startupProbe:
+      exec:
+        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
+      periodSeconds: 10
+      failureThreshold: 60
+    livenessProbe:
+      exec:
+        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 3
     extraEnv:
     - name: OTEL_ENDPOINT
       value: http://localhost:4317
@@ -658,6 +678,29 @@ orchestration-layer:
 ai-module-layer:
   enabled: true
   inhaltsextraktion:
+    # Temporal workers die silently at cold start: the module connects to the
+    # Temporal frontend once at startup, a refused connection ends the worker
+    # coroutine with a traceback, but the process (and its health server) stays
+    # up, so the pod reads Running/Ready while nothing polls its task queue
+    # (observed: all 16 module pods and llm-client after `make apply` from
+    # zero, `temporal task-queue describe` showed zero pollers for 30 min;
+    # a `rollout restart` fixed each one). The upstream charts expose no
+    # worker-health endpoint and no init-container hook, so the probes test
+    # the one observable fact: an established connection to the frontend
+    # (port 7233 = 0x1C41 in /proc/<pid>/net/tcp). The startup window is
+    # generous because inhaltsextraktion downloads two tokenizers from the
+    # Hugging Face Hub first (observed: 6 min).
+    startupProbe: &temporalWorkerStartupProbe
+      exec:
+        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
+      periodSeconds: 10
+      failureThreshold: 60
+    livenessProbe: &temporalWorkerLivenessProbe
+      exec:
+        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 3
     extraEnv:
     # The published v0.2.1 image sets TRANSFORMERS_OFFLINE=1 but does not
     # contain the expected pre-baked model cache (upstream gap, issue to
@@ -709,6 +752,8 @@ ai-module-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   formale-vollstaendigkeitspruefung:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     extraEnv:
     - name: LITELLM_MODEL
       value: self-hosted/gpt-oss-120b
@@ -721,6 +766,8 @@ ai-module-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   plausibilitaetspruefung:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     replicaCount: 2
     extraEnv:
     - name: LITELLM_MODEL
@@ -734,6 +781,8 @@ ai-module-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   materielle-vollstaendigkeitspruefung:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     extraEnv:
     - name: LLM_DB_RESEARCH_MODEL
       value: self-hosted/gpt-oss-120b
@@ -752,6 +801,8 @@ ai-module-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   einwendungsmanagement:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     extraEnv:
     - name: OTEL_ENDPOINT
       value: http://localhost:4317
@@ -762,6 +813,8 @@ ai-module-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   rechtliche-pruefung-und-bewertung:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     extraEnv:
     - name: LITELLM_MODEL
       value: self-hosted/gpt-oss-120b
@@ -774,6 +827,8 @@ ai-module-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   rechtsmethodik:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     extraEnv:
     - name: MODELS_LARGE_LLM
       value: self-hosted/gpt-oss-120b
@@ -790,6 +845,8 @@ ai-module-layer:
     - name: TEMPORAL_S3_REGION
       value: "${region}"
   anonymisierung:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     extraEnv:
     - name: LLM_MODEL
       value: self-hosted/gpt-oss-120b
@@ -804,6 +861,8 @@ ai-module-layer:
   normenermittlung:
     enabled: false
   risikohinweiser:
+    startupProbe: *temporalWorkerStartupProbe
+    livenessProbe: *temporalWorkerLivenessProbe
     extraEnv:
     - name: OTEL_ENDPOINT
       value: http://localhost:4317

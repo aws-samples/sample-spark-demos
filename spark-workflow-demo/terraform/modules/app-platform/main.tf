@@ -8,7 +8,11 @@ resource "aws_s3_object" "gesetze_normen_seed" {
   bucket = var.s3_dms_bucket
   key    = "bootstrap/gesetze-normen-seed.sql.gz"
   source = var.seed_file_path
-  etag   = filemd5(var.seed_file_path)
+  # source_hash, not etag: the bucket uses SSE-KMS, where the object's ETag is
+  # not the content MD5, so `etag = filemd5()` reads as drift and re-uploads
+  # the seed on every apply (observed: etag f98c... vs filemd5 fb7c... with
+  # an unchanged file).
+  source_hash = filemd5(var.seed_file_path)
 }
 
 resource "helm_release" "platform" {

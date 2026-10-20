@@ -274,6 +274,8 @@ occurred and forced the change.
 | TEI/BGE-M3: warmup allocates for the full `max-batch-tokens` (16384) → OOMKilled even with 16 Gi | `--max-batch-tokens=4096` + 16 Gi limit |
 | Modules validate `OTEL_ENDPOINT` with `min_length=1`, the umbrella partly sets `""` | Upstream local convention `http://localhost:4317` (the exporter degrades silently); a real collector = phase 2 |
 | The SPA ships client-side origin allowlists for presigned storage URLs (`VITE_ALLOWED_UPLOAD_ORIGINS`, `VITE_ALLOWED_DOWNLOAD_ORIGINS`) that default to empty | Both set to the regional S3 endpoint in the frontend values — with an empty allowlist the SPA blocks every upload/download client-side before any request is sent (observed: "Hochladen fehlgeschlagen" although presigned URL generation succeeded and S3 never saw a request) |
+| Temporal workers (`modul-*`, `llm-client`) connect to the Temporal frontend **once** at startup; when the frontend is not up yet, the worker coroutine dies with `RuntimeError: Failed client connect … Connection refused`, but the process and its health server stay alive, so the pod reads `Running 1/1` while nothing polls its task queue (observed after `make apply` from zero: 16 of 16 module pods and 3 of 3 `llm-client` pods dead for 30 min, `temporal task-queue describe` listed zero pollers, every uploaded document stayed `Scheduled`; a `rollout restart` fixed each one). The charts expose no worker-health endpoint and no init-container hook | Overlay sets an `exec` startup probe (10 min window) and liveness probe (3 × 30 s) on the 10 worker deployments that test the one observable fact: an established connection to the frontend (`grep ':1C41 01' /proc/1/net/tcp`, 0x1C41 = 7233). Verified: all 19 pods start with 0 restarts; with the frontend scaled to 0 all 19 are restarted by the liveness probe within 2 min, and after it returns every pod reconnects via the startup probe within 10 min |
+| `temporal-job-service`'s chart startup probe allows 60 s (6 × 10 s); at cold start the alembic migration plus the Temporal connect take about that long under the 150m CPU limit (observed: both replicas killed by the startup probe 5–6 times, `connection refused` on `/startup`, uvicorn listening the moment SIGTERM arrived; Ready after 7 min) | `startupProbe.failureThreshold: 30` in the overlay (map merge keeps the chart's `httpGet`) |
 
 #### Image tags per service (submodule at v0.2.3)
 
@@ -297,8 +299,20 @@ Within the 0.2.x line there is no API-contract change between the two
 tags, so the mixed set is uncritical. Verified statically (`helm template`
 of the staged charts with this overlay through the postrenderer: 105
 resources, the postrenderer removes exactly the three expected lines, 12 ×
-`v0.2.3` / 18 × `v0.2.1` image references); the live roll-out happens with
-the next `make apply`.
+`v0.2.3` / 18 × `v0.2.1` image references) and **verified live** on
+2026-10-20 with `make apply` from zero (195 resources, 25 min, one
+attempt): `scripts/verify.sh` green (6/6), scripted OIDC login with a
+cookie jar (Keycloak form → Envoy callback → `/app/` 200, unauthenticated
+API call → 302), project created, `demo-data/*.zip` uploaded through the
+presigned-URL sequence of the SPA (generate URL → PUT → confirm → start
+processing), `FileProcessingWorkflow` and `FVPWorkflow` completed (54
+Temporal workflows), 64 `openai.gpt-oss-120b-1:0` and 10
+`eu.mistral.pixtral-large-2502-v1:0` Bedrock invocations in `eu-central-1`
+for one two-document ZIP, both documents assigned to a required document
+type by the formal completeness check. The seed runner's `kubectl exec …
+python -m src.scripts.seed_data` on the ZenDiS minimal base images printed
+`All seeds completed.`. The two cold-start findings of that run are the
+last two rows of the table above.
 
 ### F. Data protection and hardening defaults (deployment layer)
 
