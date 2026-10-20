@@ -286,6 +286,23 @@ SAMPLE_SOLL_DOKUMENTE: "defaultdict[str, list]" = defaultdict(list)
 PYEOF
 fi
 
+# --- 3e0. Frontend: the v0.5.1 root package-lock.json is rejected by npm 10
+# (bundled with node:20-bookworm): the workspaces pin `@hey-api/openapi-ts
+# ^0.80.8` while the lock only carries the hoisted 0.97.3, and npm 10's
+# `npm ci` refuses with "package.json and package-lock.json are not in sync
+# / Missing: @hey-api/openapi-ts@0.80.18 from lock file" (observed in
+# CodeBuild; reproduced with npm 10.8.2 on the pristine export). npm 11
+# accepts the same lock unchanged (verified: `npm ci --dry-run` green with
+# 11.19.0), so the builder stage upgrades npm before `npm ci` instead of
+# regenerating the lock — the upstream lock stays authoritative
+# (upstream-issue candidate: lock drift against the workspaces).
+if grep -qE '^RUN npm ci' "$OUT_DIR/Dockerfile" 2>/dev/null && [ -f "$OUT_DIR/package-lock.json" ] \
+   && ! grep -qE 'npm install -g npm@' "$OUT_DIR/Dockerfile"; then
+  echo "==> Pinning npm 11 in the builder stage before 'npm ci' (lock rejected by npm 10)"
+  sed -i.bak -E '0,/^RUN npm ci/s//RUN npm install -g npm@11.19.0 --no-audit --no-fund\nRUN npm ci/' "$OUT_DIR/Dockerfile"
+  rm -f "$OUT_DIR/Dockerfile.bak"
+fi
+
 # --- 3e. Frontend: api-gen:* npm scripts re-generate TS clients from
 # OpenAPI spec files that the upstream CI exports from running services —
 # the yml files are not tracked (observed: ENOENT norm-matching-openapi.yml)
@@ -356,18 +373,134 @@ for root, _dirs, files in os.walk(vendor):
 EOF
 fi
 
+# --- 3f2. dokumentenpruefung's decision-step helper lagging behind the shared lib
+# decision-protocol v0.5.1 made CaseRef.proposal_id the mandatory UUID anchor
+# and application_id an optional UUID, but dokumentenpruefung's helper still
+# falls back to its service name for a missing application id — and every
+# caller passes None (observed on v0.5.1: every Vollstaendigkeits-/
+# Kohaerenzpruefung start answered 500 "1 validation error for CaseRef /
+# application_id / Input should be a valid UUID ... input_value=
+# 'dokumentenpruefung'"). Two AI call sites (plausibility result, consistency
+# analysis) pass NO id at all, so with the fallback gone CaseRef fails on
+# proposal_id (observed: "UUID input should be a string, bytes or UUID object
+# ... input_value=None", plausibility check FEHLER). Pass the optional id
+# through unchanged, and skip the decision step (not the check) when there is
+# no case anchor to attach it to; the business audit event emitted right
+# before each of these steps still flows. Upstream-issue candidate.
+if [ -f "$OUT_DIR/src/dokumentenpruefung/helpers/decision_protocol.py" ]; then
+  python3 - "$OUT_DIR/src/dokumentenpruefung/helpers/decision_protocol.py" <<'EOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+changed = False
+needle = "    case_ref = CaseRef(\n        application_id=application_id or config.SERVICE_NAME,\n        proposal_id=proposal_id,\n    )\n"
+patched = ("    if proposal_id is None and application_id is None:\n"
+           "        # Demo CI shim: no case anchor for this step (upstream call site\n"
+           "        # passes neither id); the step is skipped, the check continues.\n"
+           "        return None\n"
+           "    case_ref = CaseRef(\n        application_id=application_id,\n        proposal_id=proposal_id,\n    )\n")
+if needle in text:
+    text = text.replace(needle, patched); changed = True
+emit_needle = '    """Emit a decision step through the audit-safe logger. Never raises."""\n'
+emit_patched = emit_needle + "    if step is None:\n        return\n"
+if emit_needle in text and "    if step is None:\n        return\n" not in text:
+    text = text.replace(emit_needle, emit_patched, 1); changed = True
+text = text.replace(") -> DecisionStep:\n    \"\"\"Build a decision step for an AI decision.\"\"\"", ") -> DecisionStep | None:\n    \"\"\"Build a decision step for an AI decision.\"\"\"")
+text = text.replace(") -> DecisionStep:\n    \"\"\"Build a decision step for a human decision.\"\"\"", ") -> DecisionStep | None:\n    \"\"\"Build a decision step for a human decision.\"\"\"")
+text = text.replace("def emit_decision_step(\n    step: DecisionStep, *,", "def emit_decision_step(\n    step: \"DecisionStep | None\", *,")
+if changed:
+    open(path, "w").write(text)
+    print("    patched helpers/decision_protocol.py: optional application_id, no-anchor steps skipped")
+EOF
+fi
+
+# --- 3g. Resolver constraints for the generated locks ----------------------------
+# Upstream ships no lock and most services pin only lower bounds, so `uv lock`
+# picks the newest release and a new upstream release of a library can break
+# the cold start without any change in the submodule (observed on the first
+# v0.5.1 batch):
+# - SQLAlchemy 2.1 moved greenlet out of the default dependencies and made
+#   psycopg (3) the default postgresql driver: every asyncio engine failed at
+#   import ("The SQLAlchemy asyncio module requires that the Python 'greenlet'
+#   library is installed" — fristenmanagement, decision-log-store-service) and
+#   the psycopg2-based services crashed with "No module named 'psycopg'"
+#   (ki-guv-ai-testing, ki-guv-explainability).
+# - FastAPI 0.145 removed the `**extra` kwargs of FastAPI(); dokumentenpruefung
+#   passes `components={...}` (observed: TypeError "FastAPI.__init__() got an
+#   unexpected keyword argument 'components'"). 0.144 is the last release that
+#   accepts it (bisected on this host).
+# Both constraints keep the resolver on the lines the upstream code was
+# developed against (upstream-issue candidates: upper bounds or a lock file).
+if [ -f "$OUT_DIR/pyproject.toml" ]; then
+  echo "==> Adding uv constraint-dependencies (sqlalchemy<2.1, fastapi<0.145)"
+  python3 - "$OUT_DIR/pyproject.toml" <<'EOF'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+pins = ['"sqlalchemy<2.1"', '"fastapi<0.145"']
+missing = [p for p in pins if p.strip('"') not in text]
+if not missing:
+    sys.exit(0)
+m = re.search(r"^constraint-dependencies\s*=\s*\[", text, re.M)
+if m:
+    # Extend the existing list (e.g. decision-log-store-service constrains
+    # starlette); valid for single- and multi-line lists.
+    text = text[: m.end()] + "".join(f"\n    {p}," for p in missing) + text[m.end():]
+    open(path, "w").write(text)
+    sys.exit(0)
+constraint = "constraint-dependencies = [" + ", ".join(missing) + "]\n"
+m = re.search(r"^\[tool\.uv\]\s*$", text, re.M)
+if m:
+    text = text[: m.end()] + "\n" + constraint + text[m.end():]
+else:
+    text = text.rstrip("\n") + "\n\n[tool.uv]\n" + constraint
+open(path, "w").write(text)
+EOF
+fi
+
+# --- 3h. Vendored bizlog NoOpLogger lagging behind a caller ---------------------
+# dokumentenpruefung's bizlog_wrapper calls logger.setLevel() on the bizlog
+# logger; structlog's BoundLogger proxies any attribute to the wrapped
+# NoOpLogger, which has no setLevel (observed at import: AttributeError
+# "'NoOpLogger' object has no attribute 'setLevel'" crashloop). A no-op
+# setLevel on the vendored copy keeps the wrapper's intent (levels are
+# meaningless on a no-op sink). Upstream-issue candidate.
+if [ -f "$OUT_DIR/_vendor/03-shared-services/bizlog/src/bizlog/rabbitmq.py" ]; then
+  python3 - "$OUT_DIR/_vendor/03-shared-services/bizlog/src/bizlog/rabbitmq.py" <<'EOF'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+if "def setLevel" not in text:
+    m = re.search(r"^class NoOpLogger:\n(?:    .*\n|\n)*?(?=    def debug\()", text, re.M)
+    if m:
+        text = text[: m.end()] + "    def setLevel(self, *_args: object, **_kwargs: object) -> None:\n        \"\"\"Demo CI shim: levels are meaningless on a no-op sink.\"\"\"\n\n" + text[m.end():]
+        open(path, "w").write(text)
+        print("    added NoOpLogger.setLevel to vendored bizlog")
+EOF
+fi
+
 # --- 4. Generate uv.lock (missing upstream) ------------------------------------
 if [ -f "$OUT_DIR/pyproject.toml" ] && [ ! -f "$OUT_DIR/uv.lock" ]; then
   echo "==> Generating uv.lock"
   (cd "$OUT_DIR" && uv lock)
 fi
 
-# --- 5. Replace base image placeholders -----------------------------------------
+# --- 5. Replace base image references -------------------------------------------
+# Each map row rewrites (a) the upstream placeholder `<CONTAINER_REGISTRY>/<ref>`
+# wherever it appears and (b) a bare `FROM <ref>` / `FROM docker.io/<ref>`
+# line. Since v0.5.1 the frontend (node, nginx-unprivileged), request-proxy and
+# ki-guv-feedback (python) Dockerfiles reference Docker Hub without the
+# placeholder; rewriting them keeps every pull on public.ecr.aws/ghcr.io
+# instead of the anonymous Docker Hub rate limit shared by the NAT address.
 if [ -f "$OUT_DIR/Dockerfile" ]; then
-  echo "==> Rewriting base image placeholders"
+  echo "==> Rewriting base image references"
   while IFS='=' read -r placeholder image; do
     [[ "$placeholder" =~ ^#.*$ || -z "$placeholder" ]] && continue
     sed -i.bak "s|<CONTAINER_REGISTRY>/${placeholder}|${image}|g" "$OUT_DIR/Dockerfile"
+    # Bare FROM: anchor on the whole reference (escaped dots), keep the
+    # optional "AS <stage>" tail and tolerate trailing whitespace.
+    esc=$(printf '%s' "$placeholder" | sed -e 's/[.]/\\./g')
+    sed -i.bak -E "s#^(FROM[[:space:]]+)(docker\.io/)?${esc}([[:space:]]|\$)#\1${image}\3#" "$OUT_DIR/Dockerfile"
   done < "$MAP_FILE"
   rm -f "$OUT_DIR/Dockerfile.bak"
 

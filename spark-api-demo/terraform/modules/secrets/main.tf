@@ -239,6 +239,32 @@ resource "aws_secretsmanager_secret_version" "oauth2_proxy" {
   })
 }
 
+# Optional corporate identity provider in front of the perimeter (any OIDC
+# issuer: the operator's SSO). Created only when an issuer is configured in
+# .env; the values are the operator's own and never appear in this repository.
+resource "aws_secretsmanager_secret" "external_oidc" {
+  count = var.external_oidc_issuer_url != "" ? 1 : 0
+
+  # Client secret issued by the operator's identity provider; rotated there,
+  # re-applied here (documented demo deviation, see keycloak above).
+  #checkov:skip=CKV2_AWS_57: Static demo credentials consumed via ESO - rotation would invalidate running services
+  name                    = "${var.name}/auth/external-oidc"
+  recovery_window_in_days = 0
+  kms_key_id              = var.kms_key_arn
+  tags                    = var.tags
+}
+
+resource "aws_secretsmanager_secret_version" "external_oidc" {
+  count = var.external_oidc_issuer_url != "" ? 1 : 0
+
+  secret_id = aws_secretsmanager_secret.external_oidc[0].id
+  secret_string = jsonencode({
+    issuer_url    = var.external_oidc_issuer_url
+    client_id     = var.external_oidc_client_id
+    client_secret = var.external_oidc_client_secret
+  })
+}
+
 resource "aws_secretsmanager_secret" "s3_app" {
   # Rotation would need a rotation Lambda per credential AND consumers that
   # re-read it; the demo services receive these values once via ESO as

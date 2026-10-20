@@ -13,7 +13,7 @@ resource "helm_release" "platform" {
     appNamespace = var.app_namespace
     # checkov:skip=CKV_SECRET_6: Name of the ESO ClusterSecretStore, not a credential
     clusterSecretStore = "aws-secrets-manager"
-    secretsManager = {
+    secretsManager = merge({
       rdsMaster   = var.secret_names["rds_master"]
       rdsApp      = var.secret_names["rds_app"]
       rabbitmq    = var.secret_names["rabbitmq"]
@@ -23,7 +23,7 @@ resource "helm_release" "platform" {
       keycloak    = var.secret_names["keycloak"]
       oauth2Proxy = var.secret_names["oauth2_proxy"]
       s3App       = var.secret_names["s3_app"]
-    }
+    }, contains(keys(var.secret_names), "external_oidc") ? { externalOidc = var.secret_names["external_oidc"] } : {})
     rds = {
       host = var.rds_host
       port = var.rds_port
@@ -32,9 +32,14 @@ resource "helm_release" "platform" {
       bedrockRegion = var.bedrock_region
     }
     auth = {
-      enabled = var.auth_enabled
-      host    = var.auth_host
-      apiHost = var.api_host
+      enabled      = var.auth_enabled
+      host         = var.auth_host
+      apiHost      = var.api_host
+      cookieDomain = var.base_domain
+      externalOidc = {
+        enabled   = var.external_oidc_issuer_url != ""
+        issuerUrl = var.external_oidc_issuer_url
+      }
     }
   })]
 }

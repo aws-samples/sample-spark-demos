@@ -76,6 +76,25 @@ variable "keycloak_client_id" {
   default     = "local-client"
 }
 
+variable "external_oidc_issuer_url" {
+  description = "Issuer URL of an optional corporate OIDC provider brokered by the demo realm (empty = disabled)."
+  type        = string
+  default     = ""
+}
+
+variable "external_oidc_client_id" {
+  description = "Client ID registered at the external OIDC provider."
+  type        = string
+  default     = ""
+}
+
+variable "external_oidc_client_secret" {
+  description = "Client secret issued by the external OIDC provider."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "kms_key_arn" {
   description = "Customer-managed KMS key that encrypts every secret (kms module)."
   type        = string

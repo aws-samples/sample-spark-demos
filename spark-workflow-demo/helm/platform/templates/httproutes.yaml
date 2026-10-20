@@ -149,6 +149,16 @@ spec:
         - path:
             type: PathPrefix
             value: /realms/master
+        {{- if .Values.keycloak.externalOidc.enabled }}
+        # External provider mode: the realm's account console is a public
+        # SPA shell (200 before any login) the demo never uses; with every
+        # other page redirecting to the issuer it was the last anonymous
+        # response on this host (observed: curl -L on /realms/local/account/
+        # ended 200 while /app/ and the Temporal UI ended at the issuer).
+        - path:
+            type: PathPrefix
+            value: /realms/{{ .Values.keycloak.realm }}/account
+        {{- end }}
       filters:
         - type: ExtensionRef
           extensionRef:

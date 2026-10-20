@@ -15,6 +15,6 @@ PIPE_HASH=$( { cat "$PROJECT_DIR"/pipeline/prepare-context.sh \
                    "$PROJECT_DIR"/pipeline/base-image-map.env \
                    "$PROJECT_DIR"/pipeline/buildspec-service.yml \
                    "$PROJECT_DIR"/pipeline/buildspec-frontend.yml; \
-               find "$PROJECT_DIR"/inspector -type f | LC_ALL=C sort | xargs cat; } \
+               find "$PROJECT_DIR"/inspector -type f -not -name '*.pyc' -not -path '*/__pycache__/*' | LC_ALL=C sort | xargs cat; } \
             | { md5 -q /dev/stdin 2>/dev/null || md5sum | cut -d' ' -f1; } | cut -c1-8)
 printf '%s-p%s\n' "$GIT_SHORT" "$PIPE_HASH"

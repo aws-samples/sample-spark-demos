@@ -5,6 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning: [S
 
 ## [Unreleased]
 
+### Added
+- Optional corporate identity provider: with `EXTERNAL_OIDC_ISSUER_URL`/`_CLIENT_ID`/`_CLIENT_SECRET` set in the root `.env` (any OIDC issuer), the Keycloak bootstrap registers it as identity provider `corporate` in realm `local` (endpoints from the issuer's discovery document, realm roles `admin`+`user` for every brokered user) and makes the realm's browser login redirect straight to it, so the Keycloak login page never asks for a password. Empty = unchanged demo user. Values live in a Secrets Manager entry (`…/auth/external-oidc`), nothing provider-specific in the repository (README section C, THREAT-MODEL E-13).
+
 ### Fixed
 - Temporal workers (`modul-*`, `llm-client`) that lose or never get their connection to the Temporal frontend are restarted automatically: exec startup probe (10 min window) and liveness probe (3 × 30 s) on an established connection to port 7233. Before, a worker whose first connect was refused at cold start died silently while its pod stayed `Running 1/1`, and every uploaded document stayed `Scheduled` until a manual `rollout restart` (observed on every module and `llm-client` after `make apply` from zero). README section E.
 - `temporal-job-service` is no longer killed by its startup probe at cold start (`failureThreshold` 6 → 30; both replicas needed 5–6 restarts and 7 min before).

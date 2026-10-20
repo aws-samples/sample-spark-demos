@@ -39,6 +39,15 @@ metadata:
       if ($uri ~* "^/(admin/master|realms/master)(/|$)") {
         return 403;
       }
+    {{- if .Values.auth.externalOidc.enabled }}
+    # External provider mode: nothing on this demo may answer anonymously,
+    # the Keycloak login page included. Browsers are sent through the API
+    # host's /oauth2/start (the external provider's callback lives there);
+    # the session cookie is scoped to the shared base domain so it is valid
+    # here too, and the redirect back to this host must be allowlisted.
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy.{{ .Release.Namespace }}.svc.cluster.local:4180/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://{{ .Values.auth.apiHost }}/oauth2/start?rd=https://$host$escaped_request_uri
+    {{- end }}
 spec:
   ingressClassName: nginx
   tls:

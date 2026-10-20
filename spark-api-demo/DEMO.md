@@ -238,7 +238,7 @@ $K get statefulset,deploy -n spark-api-platform
 $K get jobs -n spark-api -n spark-api-platform
 ```
 
-## 5. RDS PostgreSQL (one instance, 12 service databases)
+## 5. RDS PostgreSQL (one instance, 13 service databases)
 
 ```bash
 aws rds describe-db-instances --db-instance-identifier spark-api-demo \
@@ -252,7 +252,7 @@ $K run psql --rm -it --restart=Never -n spark-api-platform \
   -U spark_app -d dokumentenaufbereitung
 
 # Worth seeing at the prompt:
-#   \l                                   -- 12 service databases
+#   \l                                   -- 13 service databases (decision_log_store since v0.5.1)
 #   \dt                                  -- data-service tables (procedure, proposal, ...)
 #   select count(*) from procedure;      -- Faker mock data from the seed job
 ```
@@ -274,6 +274,15 @@ open "$BASE/api/subsumtion-service/docs"
 # RabbitMQ: the scaffolding queue the adapters consume (rabbitmq-init)
 $K exec -n spark-api-platform rabbitmq-0 -- rabbitmqctl list_queues
 $K exec -n spark-api-platform rabbitmq-0 -- rabbitmqctl list_bindings
+
+# The audit trail (v0.5.1): every AI check publishes signed decision events
+# to bizlog_exchange; decision-log-store-service verifies and stores them
+# append-only. Run a Vollstaendigkeitspruefung first, then watch the ingest
+# queue drain and read a step back by its id (the service's Swagger UI
+# lists the read routes: /v1/decision-steps/{id}, /v1/cases/{application_id}/
+# {scope}/history).
+$K exec -n spark-api-platform rabbitmq-0 -- rabbitmqctl list_queues name messages consumers | grep decision_log_store
+open "$BASE/api/decision-log-store-service/docs"
 
 # Neo4j is answering (graph-api backend)
 $K exec -n spark-api-platform neo4j-0 -- cypher-shell \

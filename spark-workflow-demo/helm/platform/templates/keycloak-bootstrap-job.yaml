@@ -103,6 +103,65 @@ data:
     JSON
     "$KCADM" create partialImport -r "$REALM" -s ifResourceExists=SKIP -o -f /tmp/demo-user.json
     rm -f /tmp/demo-user.json
+{{- if .Values.keycloak.externalOidc.enabled }}
+
+    # --- Corporate identity provider (any OIDC issuer), brokered by the realm.
+    # The realm stays the issuer the apps trust (client, roles, audience
+    # mapper, identity-management-service unchanged); the external provider
+    # only authenticates. Endpoints come from the issuer's discovery document
+    # (kcadm import-config), nothing provider-specific is spelled out here.
+    IDP_ALIAS="{{ .Values.keycloak.externalOidc.alias }}"
+    IDP_ISSUER="{{ .Values.keycloak.externalOidc.issuerUrl }}"
+    echo "Registering identity provider '$IDP_ALIAS' from ${IDP_ISSUER}/.well-known/openid-configuration ..."
+    "$KCADM" create identity-provider/import-config -r "$REALM" -o \
+      -s fromUrl="${IDP_ISSUER}/.well-known/openid-configuration" \
+      -s providerId=oidc > /tmp/idp-discovered.json
+    grep -q '"authorizationUrl"' /tmp/idp-discovered.json || { echo "ERROR: discovery import returned no endpoints:" >&2; cat /tmp/idp-discovered.json >&2; exit 1; }
+    # import-config returns the flat endpoint map; wrap it into the instance
+    # body and add the client credentials, scopes and import behaviour.
+    printf '%s' "$(sed -E 's/\}\s*$//' /tmp/idp-discovered.json)" > /tmp/idp-config.json
+    cat >> /tmp/idp-config.json <<JSON
+    ,"clientId":"${EXT_OIDC_CLIENT_ID}","clientSecret":"${EXT_OIDC_CLIENT_SECRET}","clientAuthMethod":"client_secret_post","defaultScope":"openid email profile","syncMode":"IMPORT","validateSignature":"true","useJwksUrl":"true"}
+    JSON
+    {
+      printf '{"alias":"%s","providerId":"oidc","enabled":true,"trustEmail":true,"storeToken":false,"firstBrokerLoginFlowAlias":"first broker login","config":' "$IDP_ALIAS"
+      cat /tmp/idp-config.json
+      printf '}'
+    } > /tmp/idp-instance.json
+    if "$KCADM" get "identity-provider/instances/$IDP_ALIAS" -r "$REALM" >/dev/null 2>&1; then
+      "$KCADM" update "identity-provider/instances/$IDP_ALIAS" -r "$REALM" -f /tmp/idp-instance.json
+    else
+      "$KCADM" create identity-provider/instances -r "$REALM" -f /tmp/idp-instance.json
+    fi
+    rm -f /tmp/idp-discovered.json /tmp/idp-config.json /tmp/idp-instance.json
+
+    # Every brokered user gets the realm roles the demo user has.
+    for role in admin user; do
+      if ! "$KCADM" get "identity-provider/instances/$IDP_ALIAS/mappers" -r "$REALM" --fields name --format csv --noquotes | grep -qx "role-$role"; then
+        "$KCADM" create "identity-provider/instances/$IDP_ALIAS/mappers" -r "$REALM" \
+          -s "name=role-$role" \
+          -s "identityProviderAlias=$IDP_ALIAS" \
+          -s identityProviderMapper=oidc-hardcoded-role-idp-mapper \
+          -s "config.role=$role" \
+          -s 'config.syncMode=INHERIT'
+      fi
+    done
+
+    # Browser login goes straight to the provider: configure the realm's
+    # Identity Provider Redirector with this alias as the default provider,
+    # so the Keycloak login form never renders for an anonymous visitor.
+    REDIRECTOR_ID="$("$KCADM" get authentication/flows/browser/executions -r "$REALM" --fields id,providerId --format csv --noquotes | grep ',identity-provider-redirector$' | cut -d, -f1 | head -n 1)"
+    if [ -n "$REDIRECTOR_ID" ]; then
+      if ! "$KCADM" get "authentication/executions/$REDIRECTOR_ID" -r "$REALM" --fields authenticatorConfig --format csv --noquotes | grep -q .; then
+        "$KCADM" create "authentication/executions/$REDIRECTOR_ID/config" -r "$REALM" \
+          -s "alias=${IDP_ALIAS}-redirector" \
+          -s "config.defaultProvider=$IDP_ALIAS"
+      fi
+    else
+      echo "WARNING: no identity-provider-redirector execution in the browser flow; login form stays" >&2
+    fi
+    echo "Identity provider '$IDP_ALIAS' registered; browser login redirects to it."
+{{- end }}
     echo "Keycloak bootstrap finished."
 ---
 apiVersion: batch/v1
@@ -136,6 +195,12 @@ spec:
               valueFrom: { secretKeyRef: { name: keycloak-credentials, key: demo_user_email } }
             - name: DEMO_USER_PASSWORD
               valueFrom: { secretKeyRef: { name: keycloak-credentials, key: demo_user_password } }
+            {{- if .Values.keycloak.externalOidc.enabled }}
+            - name: EXT_OIDC_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: external-oidc-credentials, key: client_id } }
+            - name: EXT_OIDC_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: external-oidc-credentials, key: client_secret } }
+            {{- end }}
           volumeMounts:
             - { name: scripts, mountPath: /scripts }
       volumes:

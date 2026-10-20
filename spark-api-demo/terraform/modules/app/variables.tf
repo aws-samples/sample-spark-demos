@@ -105,6 +105,17 @@ variable "auth_host" {
   type        = string
 }
 
+variable "base_domain" {
+  description = "Base domain shared by the demo hostnames (cookie scope when the external OIDC provider fences every host)."
+  type        = string
+}
+
+variable "external_oidc_issuer_url" {
+  description = "Issuer URL of an optional corporate OIDC provider in front of the perimeter (empty = disabled)."
+  type        = string
+  default     = ""
+}
+
 variable "inspector_enabled" {
   description = "Deploy the demo inspector (edge-injected overlay + backend activity stream)."
   type        = bool

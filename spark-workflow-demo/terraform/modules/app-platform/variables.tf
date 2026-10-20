@@ -25,6 +25,12 @@ variable "secret_names" {
   type        = map(string)
 }
 
+variable "external_oidc_issuer_url" {
+  description = "Issuer URL of an optional corporate OIDC provider brokered by the demo Keycloak realm (empty = disabled)."
+  type        = string
+  default     = ""
+}
+
 variable "hosts" {
   description = "FQDNs: frontend, keycloak, temporal."
   type = object({

@@ -55,6 +55,8 @@ secretsManager:
   litellm: ""
   # checkov:skip=CKV_SECRET_6: Secrets Manager entry NAME placeholder, filled by terraform
   valkey: ""
+  # Set by terraform only when an external OIDC provider is configured.
+  externalOidc: ""
 
 hosts:
   frontend: "" # workflow.example.com
@@ -134,6 +136,16 @@ keycloak:
     id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
     firstName: "Spark"
     lastName: "Demo"
+  # Optional corporate identity provider (any OIDC issuer) brokered by the
+  # realm: the bootstrap job registers it under `alias`, maps every brokered
+  # user to the realm roles the demo user has, and makes the realm's browser
+  # login redirect straight to it (Identity Provider Redirector), so the
+  # Keycloak login page never asks for a password. Values come from the
+  # operator's .env through terraform; nothing provider-specific lives here.
+  externalOidc:
+    enabled: false
+    issuerUrl: ""
+    alias: corporate
   resources:
     requests: { cpu: 500m, memory: 1Gi }
     limits: { cpu: "2", memory: 2Gi }

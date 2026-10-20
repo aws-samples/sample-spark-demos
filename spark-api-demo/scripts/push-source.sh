@@ -82,6 +82,9 @@ say "Overlaying demo pipeline files + inspector + SOURCE_VERSION"
   # Demo tooling built alongside the upstream images (services.txt entry
   # demo-inspector); lives in this repo, not in the submodule.
   cp -R "$PROJECT_DIR"/inspector overlay/inspector
+  # Bytecode caches (a local syntax check writes them) are not part of the
+  # build input: image-tag.sh ignores them, so the zip must too.
+  find overlay/inspector -type d -name __pycache__ -prune -exec rm -r {} +
   printf '%s\n' "$IMAGE_TAG" > overlay/SOURCE_VERSION
   cd overlay && zip -q -X "$ZIP" -r .
 )

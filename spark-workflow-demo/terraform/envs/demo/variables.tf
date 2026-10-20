@@ -86,6 +86,36 @@ variable "demo_user_email" {
   default     = "demo.user@example.com"
 }
 
+# Optional corporate identity provider in front of the demo: any OIDC issuer
+# (the operator's SSO), brokered by the demo realm. Empty = disabled, the demo
+# keeps its own Keycloak login. When set, the realm's login redirects straight
+# to the issuer, so no page of the demo answers to an anonymous visitor with
+# anything but that redirect. The values come from .env (EXTERNAL_OIDC_*) and
+# never enter this repository.
+variable "external_oidc_issuer_url" {
+  description = "Issuer URL of an external OIDC provider brokered by the demo realm (empty = disabled)."
+  type        = string
+  default     = ""
+}
+
+variable "external_oidc_client_id" {
+  description = "Client ID registered at the external OIDC provider."
+  type        = string
+  default     = ""
+}
+
+variable "external_oidc_client_secret" {
+  description = "Client secret issued by the external OIDC provider."
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition     = (var.external_oidc_client_secret == "") == (var.external_oidc_issuer_url == "")
+    error_message = "EXTERNAL_OIDC_ISSUER_URL, EXTERNAL_OIDC_CLIENT_ID and EXTERNAL_OIDC_CLIENT_SECRET must be set together (or all left empty)."
+  }
+}
+
 # --- Feature flags ------------------------------------------------------------------
 variable "valkey_enabled" {
   description = "Use Amazon ElastiCache for Valkey as the docling-rq broker (false = embedded Redis container)."

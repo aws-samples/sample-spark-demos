@@ -24,6 +24,7 @@ output "secret_arns" {
     ],
     [for s in aws_secretsmanager_secret.db_user : s.arn],
     [for s in aws_secretsmanager_secret.valkey : s.arn],
+    [for s in aws_secretsmanager_secret.external_oidc : s.arn],
   )
 }
 
@@ -41,5 +42,6 @@ output "secret_names" {
     },
     { for k, s in aws_secretsmanager_secret.db_user : "rds_${k}" => s.name },
     length(aws_secretsmanager_secret.valkey) > 0 ? { valkey = aws_secretsmanager_secret.valkey[0].name } : {},
+    length(aws_secretsmanager_secret.external_oidc) > 0 ? { external_oidc = aws_secretsmanager_secret.external_oidc[0].name } : {},
   )
 }

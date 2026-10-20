@@ -19,6 +19,8 @@ secretsManager:
   bizlog: ""
   keycloak: ""
   oauth2Proxy: ""
+  # Set by terraform only when an external OIDC provider is configured.
+  externalOidc: ""
   s3App: ""
 
 # OSS auth perimeter (Keycloak + oauth2-proxy). SPARK API ships no auth —
@@ -28,9 +30,20 @@ auth:
   # Public Keycloak host and the protected API host (set by terraform).
   host: ""
   apiHost: ""
+  # Base domain shared by host and apiHost (set by terraform): cookie scope
+  # when the external provider fences every host of the demo.
+  cookieDomain: ""
   clusterIssuer: letsencrypt
   realm: local
   clientId: spark-api-demo
+  # Optional corporate identity provider in front of the perimeter (any OIDC
+  # issuer). When enabled, oauth2-proxy authenticates against issuerUrl with
+  # the client in the external-oidc secret instead of the demo Keycloak, and
+  # the Keycloak host is fenced behind the same check. Values come from the
+  # operator's .env through terraform; nothing provider-specific lives here.
+  externalOidc:
+    enabled: false
+    issuerUrl: ""
   demoUser:
     id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
     firstName: "Spark"
@@ -128,6 +141,7 @@ dbInit:
   # umbrella sets the matching env vars — never rely on upstream defaults).
   databases:
     - berichtskonfigurator
+    - decision_log_store
     - dokumentenaufbereitung
     - dokumentenpruefung
     - fristenmanagement

@@ -80,6 +80,10 @@ module "secrets" {
   rds_port    = module.rds.port
   auth_host   = local.auth_fqdn
 
+  external_oidc_issuer_url    = var.external_oidc_issuer_url
+  external_oidc_client_id     = var.external_oidc_client_id
+  external_oidc_client_secret = var.external_oidc_client_secret
+
   s3_endpoint_url      = module.s3.s3_endpoint_url
   s3_region            = var.aws_region
   s3_bucket_names      = module.s3.bucket_names
@@ -189,9 +193,13 @@ module "app" {
   ecr_prefix   = local.name
   image_tag    = var.image_tag
 
-  api_host        = local.api_fqdn
-  auth_host       = local.auth_fqdn
-  auth_enabled    = var.auth_enabled
+  api_host     = local.api_fqdn
+  auth_host    = local.auth_fqdn
+  auth_enabled = var.auth_enabled
+  base_domain  = var.base_domain
+
+  external_oidc_issuer_url = var.external_oidc_issuer_url
+
   s3_endpoint_url = module.s3.s3_endpoint_url
   region          = var.aws_region
   s3_bucket       = module.s3.bucket_names["documents"]

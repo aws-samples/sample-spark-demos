@@ -70,6 +70,13 @@ endif
 ifdef DEMO_ALLOWED_CIDRS
 export TF_VAR_allowed_cidrs := $(DEMO_ALLOWED_CIDRS)
 endif
+# Shared with spark-api-demo: optional corporate OIDC provider in front of
+# every page (empty = disabled, Keycloak demo login as before).
+ifdef EXTERNAL_OIDC_ISSUER_URL
+export TF_VAR_external_oidc_issuer_url    := $(EXTERNAL_OIDC_ISSUER_URL)
+export TF_VAR_external_oidc_client_id     := $(EXTERNAL_OIDC_CLIENT_ID)
+export TF_VAR_external_oidc_client_secret := $(EXTERNAL_OIDC_CLIENT_SECRET)
+endif
 
 .PHONY: init plan apply destroy validate fmt outputs check-env stage-charts
 

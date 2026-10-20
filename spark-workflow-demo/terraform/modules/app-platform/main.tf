@@ -28,7 +28,7 @@ resource "helm_release" "platform" {
     appNamespace       = var.app_namespace
     clusterSecretStore = var.cluster_secret_store
 
-    secretsManager = {
+    secretsManager = merge({
       rdsMaster   = var.secret_names["rds_master"]
       rdsApp      = var.secret_names["rds_app"]
       rdsTemporal = var.secret_names["rds_temporal"]
@@ -40,6 +40,13 @@ resource "helm_release" "platform" {
       spicedb     = var.secret_names["spicedb"]
       litellm     = var.secret_names["litellm"]
       valkey      = var.valkey_enabled ? var.secret_names["valkey"] : ""
+    }, contains(keys(var.secret_names), "external_oidc") ? { externalOidc = var.secret_names["external_oidc"] } : {})
+
+    keycloak = {
+      externalOidc = {
+        enabled   = var.external_oidc_issuer_url != ""
+        issuerUrl = var.external_oidc_issuer_url
+      }
     }
 
     hosts = {

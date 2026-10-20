@@ -53,6 +53,18 @@ spec:
                 -H 'Content-Type: application/json' \
                 -d '{"routing_key": ""}' \
                 http://rabbitmq:15672/api/bindings/%2f/e/test.exchange/q/test.queue
+              # bizlog -> decision-log-store-service (v0.5.1): the publishers own
+              # bizlog_exchange and declare it durable/direct on their first
+              # audit event; the consumer only asserts it passively (retrying
+              # with backoff, then exits). On a cold start no audit event exists
+              # before someone uses the app, so the consumer would never become
+              # Ready. Declaring the exchange here, with the exact arguments the
+              # publishers use (BIZLOG_TOPOLOGY_DURABLE=true), breaks the wait.
+              echo "declaring bizlog_exchange (idempotent PUT)"
+              curl -fsS -u "$RMQ_USER:$RMQ_PASS" -X PUT \
+                -H 'Content-Type: application/json' \
+                -d '{"type": "direct", "durable": true}' \
+                http://rabbitmq:15672/api/exchanges/%2f/bizlog_exchange
               echo "rabbitmq-init done"
           env:
             - name: RMQ_USER

@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning: [S
 
 ## [Unreleased]
 
+### Changed
+- Upstream submodule bumped from the release tag v0.4.1 (02f0a97) to **v0.5.1** (6478508, 2026-09-28): 14 upstream commits — package updates, generation-artifact removal, per-service `mistralai` pins, licensing cleanup. Directory layout, Helm scaffold charts, frontend contract and the dokumentenaufbereitung schema are unchanged (README A/B/C).
+- Build pipeline: the dokumentenschwaerzung orchestrator and PDF-PII detector build their test-deps stage from `uv:0.9.30-python3.12-bookworm-slim` pinned by tag **and** digest (upstream's placeholder suffix is the ghcr.io index digest, verified); `pipeline/base-image-map.env` rows now also rewrite bare `FROM` lines, so the frontend (`node:20-bookworm`, `nginxinc/nginx-unprivileged:1.29-alpine`), request-proxy and ki-guv-feedback (`python:3.12-*`) pull from public.ecr.aws instead of Docker Hub. All 24 upstream contexts lock with `uv lock` (mistralai 1.12.4 for norm-matching, rechtsquellenvorbereitung, risikohinweis, subsumtion).
+- Verified live 2026-10-20 with `make bootstrap` from zero (220 + 4 resources, 25 images, cold image batch about 20 min): `scripts/verify.sh` 6/6 green, scripted OIDC login, Vollstaendigkeitspruefung `ENTWURF` with 2 of 3 Soll-Dokumente matched, Kohaerenzpruefung with Plausibilitaet **and** Konsistenz `ENTWURF` and Hinweise — twice in a row; 72 signed decision steps stored in `decision_log_store` by the decision log store, none dead-lettered; 57 Claude Haiku + 49 gpt-oss Bedrock invocations in the hour (README C/G).
+- dokumentenpruefung's default model is the structured-output alias (`LLM_DEFAULT_MODEL="<LLM_MODEL>"`): v0.5.1 dropped the per-prompt model override, so the service default decides every check call (README C).
+
+### Fixed
+- Cold-start regressions found on the first v0.5.1 bootstrap and fixed in the deployment layer: frontend `npm ci` rejects the v0.5.1 lock on npm 10 (npm 11 pinned in the builder stage); SQLAlchemy 2.1 and FastAPI 0.145 broke six services at import (resolver constraints `sqlalchemy<2.1`, `fastapi<0.145`); `NoOpLogger.setLevel` missing for dokumentenpruefung (shim on the vendored bizlog); dokumentenpruefung's decision-step helper vs. decision-protocol v0.5.1 (non-UUID fallback dropped, anchorless steps skipped); berichtskonfigurator bound to the loopback address (`HOST=0.0.0.0`); ner-extraction `INFERENCE_*` rename and `PROMPT_LANG`; dokumentenaufbereitung-monorepo `EMBEDDING_MODEL(_REVISION)`. Each with the observed error in README A/C.
+
+### Added
+- Optional corporate identity provider in front of every page: with `EXTERNAL_OIDC_ISSUER_URL`/`_CLIENT_ID`/`_CLIENT_SECRET` set in the root `.env` (any OIDC issuer), oauth2-proxy authenticates against that issuer instead of the demo Keycloak and the Keycloak host is fenced behind the same check, so an anonymous visitor gets nothing but a redirect to the issuer. Empty = unchanged demo login. Values live in a Secrets Manager entry (`…/auth/external-oidc`), nothing provider-specific in the repository (README "Auth perimeter", THREAT-MODEL E-13).
+- `decision-log-store-service` (new upstream service at v0.5.1): built, deployed and wired — own database `decision_log_store` (13th, created by db-init), consumes the signed audit/decision events from `bizlog_exchange` and verifies them with the bizlog signing key (`HMAC_SIGNING_KEY`).
+- bizlog audit routing: every bizlog consumer (14 enabled services) now publishes signed audit/decision events to RabbitMQ (durable topology, dedicated audit route to the decision log store) instead of fallback-only local logging; ordinary business events stay on stdout. `rabbitmq-init` declares the producer-owned `bizlog_exchange` so the consumer is Ready at cold start. Closes THREAT-MODEL R-6 as an open finding (now Low).
+
+### Removed
+- `BIZLOG_AUDIT_ENDPOINT` and `BIZLOG_EVENT_VERSION` from the wiring matrix where the v0.5.1 shared lib is the only reader (the two dokumentenaufbereitung services keep them: their own config still declares them as required); the duplicate `BIZLOG_AUDIT_SIGNING_KEY` keys of three service blocks.
+
 ### Security
 - Non-production disclaimer in the first screen of the README (and the root README), linking the threat model.
 - `auth_enabled=false` is refused by Terraform unless `allowed_cidrs` (`DEMO_ALLOWED_CIDRS`) is non-empty (`terraform_data.perimeter_guard` precondition): no OIDC perimeter plus an open NLB would expose every service anonymously.

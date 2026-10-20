@@ -32,12 +32,34 @@ spec:
               value: static://202
             - name: OAUTH2_PROXY_REVERSE_PROXY
               value: "true"
+            {{- if .Values.auth.externalOidc.enabled }}
+            # External provider mode: a generic OIDC issuer (the operator's
+            # SSO) with standard discovery. Every page of the demo, the
+            # Keycloak host included, is behind this check (auth-ingress).
+            - name: OAUTH2_PROXY_PROVIDER
+              value: oidc
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: external-oidc, key: client-id } }
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: external-oidc, key: client-secret } }
+            - name: OAUTH2_PROXY_OIDC_ISSUER_URL
+              value: {{ .Values.auth.externalOidc.issuerUrl | quote }}
+            - name: OAUTH2_PROXY_SCOPE
+              value: openid email profile
+            # One session for every host of the demo: cookie on the shared
+            # base domain, redirects back to any host under it.
+            - name: OAUTH2_PROXY_COOKIE_DOMAINS
+              value: {{ printf ".%s" .Values.auth.cookieDomain | quote }}
+            - name: OAUTH2_PROXY_WHITELIST_DOMAINS
+              value: {{ printf ".%s" .Values.auth.cookieDomain | quote }}
+            {{- else }}
             - name: OAUTH2_PROXY_PROVIDER
               value: keycloak-oidc
             - name: OAUTH2_PROXY_CLIENT_ID
               value: {{ .Values.auth.clientId }}
             - name: OAUTH2_PROXY_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: oauth2-proxy, key: client-secret } }
+            {{- end }}
             - name: OAUTH2_PROXY_COOKIE_SECRET
               valueFrom: { secretKeyRef: { name: oauth2-proxy, key: cookie-secret } }
             - name: OAUTH2_PROXY_COOKIE_SECURE
@@ -61,6 +83,7 @@ spec:
               value: "true"
             - name: OAUTH2_PROXY_CODE_CHALLENGE_METHOD
               value: S256
+            {{- if not .Values.auth.externalOidc.enabled }}
             - name: OAUTH2_PROXY_SKIP_OIDC_DISCOVERY
               value: "true"
             - name: OAUTH2_PROXY_OIDC_ISSUER_URL
@@ -73,6 +96,7 @@ spec:
               value: http://keycloak.{{ .Release.Namespace }}.svc.cluster.local:8080/realms/{{ .Values.auth.realm }}/protocol/openid-connect/certs
             - name: OAUTH2_PROXY_PROFILE_URL
               value: http://keycloak.{{ .Release.Namespace }}.svc.cluster.local:8080/realms/{{ .Values.auth.realm }}/protocol/openid-connect/userinfo
+            {{- end }}
             # Identity headers for the nginx auth-response-headers pass-through.
             - name: OAUTH2_PROXY_SET_XAUTHREQUEST
               value: "true"

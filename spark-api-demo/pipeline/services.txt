@@ -7,6 +7,7 @@
 # demos-einwendungsmanagement (standalone platform trio);
 # tatbestandsmerkmalsextraction ships no Dockerfile upstream.
 berichtskonfigurator 02-backend/berichtskonfigurator service
+decision-log-store-service 02-backend/decision-log-store-service service
 dokumentenaufbereitung-data-service 02-backend/dokumentenaufbereitung-data-service service
 dokumentenaufbereitung-monorepo 02-backend/dokumentenaufbereitung-monorepo service
 dokumentenpruefung 02-backend/dokumentenpruefung service

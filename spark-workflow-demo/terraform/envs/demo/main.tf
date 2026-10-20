@@ -107,6 +107,10 @@ module "secrets" {
   keycloak_demo_user_email = var.demo_user_email
   keycloak_host            = local.keycloak_fqdn
 
+  external_oidc_issuer_url    = var.external_oidc_issuer_url
+  external_oidc_client_id     = var.external_oidc_client_id
+  external_oidc_client_secret = var.external_oidc_client_secret
+
   tags = local.tags
 }
 
@@ -190,6 +194,8 @@ module "app_platform" {
   app_namespace        = module.k8s_addons.app_namespace
   cluster_secret_store = module.k8s_addons.cluster_secret_store_name
   secret_names         = module.secrets.secret_names
+
+  external_oidc_issuer_url = var.external_oidc_issuer_url
 
   hosts = {
     frontend = local.frontend_fqdn

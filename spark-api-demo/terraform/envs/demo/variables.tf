@@ -45,6 +45,36 @@ variable "auth_enabled" {
   default     = true
 }
 
+# Optional corporate identity provider in front of the perimeter: any OIDC
+# issuer (the operator's SSO). Empty = disabled, the demo keeps its own
+# Keycloak login. When set, oauth2-proxy authenticates against this issuer and
+# the Keycloak host is fenced behind the same check, so no page of the demo
+# answers anonymously. The values come from .env (EXTERNAL_OIDC_*) and never
+# enter this repository.
+variable "external_oidc_issuer_url" {
+  description = "Issuer URL of an external OIDC provider placed in front of the demo (empty = disabled)."
+  type        = string
+  default     = ""
+}
+
+variable "external_oidc_client_id" {
+  description = "Client ID registered at the external OIDC provider."
+  type        = string
+  default     = ""
+}
+
+variable "external_oidc_client_secret" {
+  description = "Client secret issued by the external OIDC provider."
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition     = (var.external_oidc_client_secret == "") == (var.external_oidc_issuer_url == "")
+    error_message = "EXTERNAL_OIDC_ISSUER_URL, EXTERNAL_OIDC_CLIENT_ID and EXTERNAL_OIDC_CLIENT_SECRET must be set together (or all left empty)."
+  }
+}
+
 variable "bedrock_region" {
   description = "Region for Amazon Bedrock model invocation (gpt-oss-120b on-demand and the eu. Claude Haiku 4.5 profile are available in eu-central-1; may differ from aws_region — a different region means prompts and documents cross a region boundary)."
   type        = string

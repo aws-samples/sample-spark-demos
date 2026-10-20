@@ -4,7 +4,9 @@
 #   - LLM (OpenAI-compatible) -> in-cluster LiteLLM (Bedrock backend)
 #   - APP_ENV=dev everywhere: all traffic is same-origin behind one host,
 #     and non-dev environments enforce ALLOWED_ORIGINS in most services
-#   - BIZLOG_FALLBACK_ONLY=true: audit events log locally, no broker dep
+#   - bizlog: audit/decision events are signed and published to RabbitMQ
+#     (`bizlog_exchange` -> decision-log-store-service); ordinary business
+#     events stay on stdout (BIZLOG_* block per service, identical)
 #   - Pharia Document Index/reranker: placeholder values, documented
 #     functional gap (proprietary SaaS)
 #   - NODE_IP via downward API where services export traces (disabled)
@@ -43,6 +45,11 @@ services:
     port: 8001
     env:
       ENVIRONMENT: development
+      # v0.5.1 starts through the console script (`uvicorn.run(host=settings.host)`)
+      # instead of `uvicorn --host 0.0.0.0`; the setting defaults to the
+      # loopback address, so the pod listened on 127.0.0.1:8001 and the
+      # readiness probe on the pod IP was refused (observed: Running 0/1).
+      HOST: 0.0.0.0
       POSTGRES_HOST: "${rds_host}"
       POSTGRES_PORT: "${rds_port}"
       POSTGRES_DB: berichtskonfigurator
@@ -62,6 +69,46 @@ services:
       TEX2PDF_API_URL: "http://tex2pdf-service.${app_namespace}.svc.cluster.local"
       SCORE_API_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
       DISABLE_TRACING: "true"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
+
+  # Decision log store (new at v0.5.1): consumes the signed audit/decision
+  # events bizlog publishes to `bizlog_exchange` (routing key `bizlog`) into
+  # its own PostgreSQL database (alembic runs at startup) and serves them on
+  # /v1/decision-steps. Env contract: config.py (pydantic, upper-case names).
+  # HMAC_SIGNING_KEY must equal the publishers' BIZLOG_AUDIT_SIGNING_KEY —
+  # it is the same Secrets Manager entry.
+  decision-log-store-service:
+    enabled: true
+    env:
+      POSTGRES_HOST: "${rds_host}"
+      POSTGRES_PORT: "${rds_port}"
+      POSTGRES_DB: decision_log_store
+      POSTGRES_USER: { secret: { name: rds-app, key: username } }
+      POSTGRES_PASSWORD: { secret: { name: rds-app, key: password } }
+      AMQP_URL: { secret: { name: rabbitmq, key: url } }
+      AMQP_EXCHANGE: bizlog_exchange
+      AMQP_QUEUE: decision_log_store.ingest
+      AMQP_ROUTING_KEY: bizlog
+      HMAC_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      ENVIRONMENT: demo
+      SERVICE_VERSION: "${image_tag}"
+      NODE_IP: { fieldRef: status.hostIP }
 
   dokumentenaufbereitung-data-service:
     enabled: true
@@ -72,7 +119,6 @@ services:
       DATABASE_POSTGRES_SCHEMA: public
       DATABASE_USERNAME: { secret: { name: rds-app, key: username } }
       DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
-      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
       AI_API_URL: "${litellm_url}"
       AI_API_KEY: { secret: { name: litellm, key: master_key } }
       OBJECT_STORAGE_BUCKET_NAME: "${s3_bucket}"
@@ -81,20 +127,31 @@ services:
       OBJECT_STORAGE_ACCESS_KEY: { secret: { name: s3-app, key: access_key_id } }
       OBJECT_STORAGE_SECRET_KEY: { secret: { name: s3-app, key: secret_access_key } }
       CORS_ALLOW_ORIGIN_REGEX: ".*"
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
-      BIZLOG_LOCAL_LOGS: "true"
-      BIZLOG_LOG_FORMAT: json
-      BIZLOG_AUDIT_ENABLED: "false"
-      BIZLOG_AUDIT_SIGNING_KEY: ""
-      BIZLOG_AUDIT_ENDPOINT: ""
-      BIZLOG_EVENT_VERSION: "0.1.0"
       SERVICE_ENVIRONMENT: demo
       SERVICE_NAME: dokumentenaufbereitung-data-service
       SERVICE_VERSION: "${image_tag}"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
+      # The service's own config (not the shared lib) still declares these two
+      # as required strings (observed: AppConfigError "The BIZLOG_AUDIT_ENDPOINT
+      # field is required"); the lib ignores them.
+      BIZLOG_AUDIT_ENDPOINT: ""
+      BIZLOG_EVENT_VERSION: "0.1.0"
 
   dokumentenaufbereitung-monorepo:
     enabled: true
@@ -108,7 +165,6 @@ services:
       DATABASE_POSTGRES_SCHEMA: public
       DATABASE_USERNAME: { secret: { name: rds-app, key: username } }
       DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
-      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
       INFERENCE_AI_API_KEY: { secret: { name: litellm, key: master_key } }
       INFERENCE_AI_INFERENCE_API_URL: "${litellm_url}"
       INFERENCE_AI_FALLBACK_INFERENCE_API_URL: "${litellm_url}"
@@ -130,20 +186,41 @@ services:
       CONCURRENT_BATCH_LIMIT: "2"
       DOCUMENT_KEY_BASE: documents
       DOCLING_SERVICE_MODEL: "${chat_model}"
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
-      BIZLOG_LOCAL_LOGS: "true"
-      BIZLOG_LOG_FORMAT: json
-      BIZLOG_AUDIT_ENABLED: "false"
-      BIZLOG_AUDIT_SIGNING_KEY: ""
-      BIZLOG_AUDIT_ENDPOINT: ""
-      BIZLOG_EVENT_VERSION: "0.1.0"
       SERVICE_ENVIRONMENT: demo
       SERVICE_NAME: dokumentenaufbereitung-monorepo
       SERVICE_VERSION: "${image_tag}"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
+      # The service's own config (not the shared lib) still declares these two
+      # as required strings (observed: AppConfigError "The BIZLOG_AUDIT_ENDPOINT
+      # field is required"); the lib ignores them.
+      BIZLOG_AUDIT_ENDPOINT: ""
+      BIZLOG_EVENT_VERSION: "0.1.0"
+      # New required at v0.5.1: tokenizer for the structural chunker
+      # (HuggingFace AutoTokenizer.from_pretrained(EMBEDDING_MODEL, revision=...)).
+      # Same model and pinned revision as the TEI embedding server, so chunk
+      # sizes match the embedding model; downloaded at pod start (upstream's
+      # own default is an offline MiniLM copy baked into the image under
+      # /opt/models, used only with LOCAL_AI_MODELS_USAGE=true). HF_HOME must
+      # be writable: the image runs as uid 1001 without HOME.
+      EMBEDDING_MODEL: BAAI/bge-m3
+      EMBEDDING_MODEL_REVISION: 5617a9f61b028005a4858fdac845db406aefb181
+      HF_HOME: /tmp/hf
 
   dokumentenpruefung:
     enabled: true
@@ -160,23 +237,47 @@ services:
       LLM_ENDPOINT: "${litellm_url}"
       LLM_FALLBACK_ENDPOINT: "${litellm_url}"
       LLM_API_KEY: { secret: { name: litellm, key: master_key } }
-      LLM_DEFAULT_MODEL: "${chat_model}"
+      # v0.5.1 no longer overrides the model per prompt (the registries'
+      # <LLM_MODEL> pin and `client.model = ...` are gone), so EVERY check
+      # call uses this default — and upstream's own default is the
+      # placeholder alias. With the chat model here the schema is not enforced
+      # and the checks fail nondeterministically (observed: `{"kern": ...}` →
+      # "1 validation error for IstDokumentZusammenfassung zusammenfassung
+      # Field required", "2 validation errors for DokumentenanalysePlausibilitaet",
+      # "LLMAntwortInkonsistenzenList"): the pipelines need enforced structured
+      # output, which on Bedrock only the alias (Claude Haiku via converse)
+      # delivers — see README D.
+      LLM_DEFAULT_MODEL: "<LLM_MODEL>"
       EMBEDDING_ENDPOINT: "${litellm_url}"
       EMBEDDING_FALLBACK_ENDPOINT: "${litellm_url}"
       EMBEDDING_API_KEY: { secret: { name: litellm, key: master_key } }
       EMBEDDING_DEFAULT_MODEL: "${embedding_model}"
       KI_GUV_FEEDBACK_API: "http://ki-guv-feedback.${app_namespace}.svc.cluster.local"
-      BIZLOG_FALLBACK_ONLY: "true"
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
       KI_GUV_EXPLAINABILITY_API_BASE_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
       DOKUMENTENAUFBEREITUNG_DATA_SERVICE_URL: "http://dokumentenaufbereitung-data-service.${app_namespace}.svc.cluster.local"
       DOKUMENTENAUFBEREITUNG_MONOREPO_URL: "http://dokumentenaufbereitung-monorepo.${app_namespace}.svc.cluster.local"
       NODE_IP: { fieldRef: status.hostIP }
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   dokumentenschwaerzung-orchestrator:
     enabled: true
     env:
-      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
       QUEUE_PII_DETECTION_REQUEST: dokumentenschwaerzung-pii-detection-request
       QUEUE_PII_DETECTION_RESPONSE: dokumentenschwaerzung-pii-detection-response
       QUEUE_PDF_REDACTION_REQUEST: dokumentenschwaerzung-pdf-redaction-request
@@ -186,17 +287,26 @@ services:
       OBJECT_STORAGE_REGION_NAME: "${s3_region}"
       OBJECT_STORAGE_ACCESS_KEY: { secret: { name: s3-app, key: access_key_id } }
       OBJECT_STORAGE_SECRET_KEY: { secret: { name: s3-app, key: secret_access_key } }
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
-      BIZLOG_LOCAL_LOGS: "true"
-      BIZLOG_LOG_FORMAT: json
-      BIZLOG_AUDIT_ENABLED: "false"
       SERVICE_ENVIRONMENT: demo
       SERVICE_NAME: dokumentenschwaerzung-orchestrator
       SERVICE_VERSION: "${image_tag}"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   dokumentenschwaerzung-pdf-pii-detector:
     enabled: true
@@ -229,17 +339,26 @@ services:
       VECTOR_DB_NAMESPACE: demo
       VECTOR_DB_INDEX: demo-index
       ALLOW_ORIGIN_REGEX: ".*"
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
-      BIZLOG_LOCAL_LOGS: "true"
-      BIZLOG_LOG_FORMAT: json
-      BIZLOG_AUDIT_ENABLED: "false"
       SERVICE_ENVIRONMENT: demo
       SERVICE_NAME: dokumentensuche
       SERVICE_VERSION: "${image_tag}"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   fristenmanagement:
     enabled: true
@@ -301,14 +420,26 @@ services:
       PHARIA_AI_API_URL: "${litellm_url}"
       PHARIA_AI_API_URL_FALLBACK: "${litellm_url}"
       MISTRAL_MODEL: "${chat_model}"
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
       CORS_ALLOW_ORIGIN_REGEX: ".*"
       NODE_IP: { fieldRef: status.hostIP }
       TRACING_ENABLED: "false"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   ki-guv-feedback:
     # DISABLED (documented functional gap, upstream-issue candidate): the
@@ -334,14 +465,26 @@ services:
       PARTIAL_SUBSUMPTION_OPTIONAL_FEEDBACK_CLUSTERING_MODEL_FILEPATH: /app/models/partial.pkl
       OVERALL_SUBSUMPTION_OPTIONAL_FEEDBACK_CLUSTERING_MODEL_FILEPATH: /app/models/overall.pkl
       MODEL_FILE_HMAC_SECRET: demo-placeholder
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
       CORS_ORIGIN_REGEX: ".*"
       NODE_IP: { fieldRef: status.hostIP }
       TRACING_ENABLED: "false"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   kommentar-service:
     enabled: true
@@ -359,11 +502,23 @@ services:
       SERVICE_NAME: kommentar-service
       SERVICE_VERSION: "${image_tag}"
       CORS_ALLOW_ORIGIN_REGEX: ".*"
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
       BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   nachforderungen:
     enabled: true
@@ -377,26 +532,36 @@ services:
       DATABASE_PASSWORD: { secret: { name: rds-app, key: password } }
       SERVICE_NAME: nachforderungen
       SERVICE_VERSION: "${image_tag}"
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
       BIZLOG_LOCAL_LOGS: "true"
       BIZLOG_LOG_FORMAT: json
-      BIZLOG_AUDIT_ENABLED: "false"
-      # Non-empty: bizlog raises "Audit-safe logging requires a signing
-      # key" here even with audit disabled (observed).
-      BIZLOG_AUDIT_SIGNING_KEY: demo-placeholder
-      BIZLOG_AUDIT_ENDPOINT: ""
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   ner-extraction:
     enabled: true
     env:
-      LLM_API_URL: "${litellm_url}"
-      LLM_FALLBACK_API_URL: "${litellm_url}"
-      LLM_API_KEY: { secret: { name: litellm, key: master_key } }
-      LLM_MODEL_NAME: "${chat_model}"
+      # v0.5.1 renamed LLM_* to INFERENCE_* and removed the legacy aliases
+      # (observed: AppConfigError "The INFERENCE_API_URL field is required").
+      INFERENCE_API_URL: "${litellm_url}"
+      INFERENCE_FALLBACK_API_URL: "${litellm_url}"
+      INFERENCE_API_KEY: { secret: { name: litellm, key: master_key } }
+      INFERENCE_MODEL_NAME: "${chat_model}"
+      # Read with os.environ[] at import time, no default (observed: KeyError
+      # 'PROMPT_LANG' crashloop); the prompt directory ships German prompts.
+      PROMPT_LANG: de
 
   norm-matching:
     enabled: true
@@ -420,10 +585,25 @@ services:
       DOCUMENT_INDEX_API_KEY: demo-placeholder
       DOCUMENT_INDEX_API_URL: "http://localhost:9"
       DOCUMENT_INDEX_NAMESPACE: Studio
-      BIZLOG_FALLBACK_ONLY: "true"
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
       NODE_IP: { fieldRef: status.hostIP }
       TRACING_ENABLED: "false"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   rechtsquellenvorbereitung:
     # DISABLED (documented functional gap, upstream-issue candidate): the
@@ -446,6 +626,23 @@ services:
       GRAPH_API_BASE_URL: "http://graph-api.${app_namespace}.svc.cluster.local"
       NODE_IP: { fieldRef: status.hostIP }
       TRACING_ENABLED: "false"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   request-proxy:
     enabled: true
@@ -459,6 +656,23 @@ services:
       SERVICE_VERSION: "${image_tag}"
       ENVIRONMENT: demo
       NODE_IP: { fieldRef: status.hostIP }
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   risikohinweis-service:
     enabled: true
@@ -478,10 +692,25 @@ services:
       RERANKER_BASE_URL: "http://localhost:9"
       RERANKER_API_KEY: demo-placeholder
       RERANKER_MODEL: demo-placeholder
-      BIZLOG_FALLBACK_ONLY: "true"
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
       NODE_IP: { fieldRef: status.hostIP }
       TRACING_ENABLED: "false"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   subsumtion-service:
     enabled: true
@@ -498,13 +727,25 @@ services:
       NORM_MATCHING_BASE_URL: "http://norm-matching.${app_namespace}.svc.cluster.local"
       EXPLAINABILITY_TRANSPARENCY_BASE_URL: "http://ki-guv-explainability.${app_namespace}.svc.cluster.local"
       RISIKOHINWEIS_BASE_URL: "http://risikohinweis-service.${app_namespace}.svc.cluster.local"
-      BIZLOG_FALLBACK_ONLY: "true"
-      # AuditSafeLogger refuses to construct without a signing key even in
-      # fallback mode (observed: kommentar-service crashloop "Audit-safe
-      # logging requires a signing key" at import time).
-      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
       NODE_IP: { fieldRef: status.hostIP }
       TRACING_ENABLED: "false"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   tex2pdf-service:
     enabled: true
@@ -519,6 +760,23 @@ services:
       BERICHTSKONFIGURATOR_URL: "http://berichtskonfigurator.${app_namespace}.svc.cluster.local"
       ALLOWED_ORIGIN_REGEX: ".*"
       ENABLE_TRACING: "false"
+      # bizlog (shared lib, v0.5.1): audit/decision events go to the broker
+      # and are consumed by decision-log-store-service; ordinary business
+      # events stay on stdout (BIZLOG_BUSINESS_EVENT_SINK=auto with a
+      # dedicated audit route). Publishers own `bizlog_exchange` and declare
+      # it durable (the DLS asserts it passively); the sequence store must be
+      # writable in the read-only image (non-root), hence /tmp.
+      RABBITMQ_URL: { secret: { name: rabbitmq, key: url } }
+      BIZLOG_FALLBACK_ONLY: "false"
+      BIZLOG_LOCAL_LOGS: "true"
+      BIZLOG_LOG_FORMAT: json
+      BIZLOG_TOPOLOGY_DURABLE: "true"
+      BIZLOG_AUDIT_ENABLED: "true"
+      BIZLOG_AUDIT_SIGNING_KEY: { secret: { name: bizlog, key: signing_key } }
+      BIZLOG_AUDIT_SEQUENCE_STORE: /tmp/audit_sequence.json
+      BIZLOG_AUDIT_EXCHANGE: bizlog_exchange
+      BIZLOG_AUDIT_QUEUE: decision_log_store.ingest
+      BIZLOG_AUDIT_ROUTING_KEY: bizlog
 
   xoev-adapter:
     enabled: true
