@@ -26,6 +26,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning: [S
 ### Changed
 - README: new section F "Data protection and hardening defaults"; "Known functional gaps" moved to G.
 - `pipeline/base-image-map.env` unchanged; digest pinning of the upstream base images remains a documented follow-up (THREAT-MODEL 4.3).
+- `.terraform.lock.hcl` additionally carries the `linux_arm64` provider hashes (same provider versions; `terraform init` on an arm64 Linux operator host no longer modifies the tracked lock file).
+- README intro names the upstream project by its openCode link and license only; the shared threat model (`docs/THREAT-MODEL.md`) describes the current controls without revision markers or change history.
 
 ### Security (earlier)
 - Keycloak admin surface no longer answers from the internet: `/admin/master/**` (the console for every realm) and `/realms/master/**` return 403 at the edge (nginx `server-snippet` on the Keycloak Ingress). Driven by a security scan of the live deploy — the master realm's admin console was reachable with only the generated bootstrap password in front of it. Scope stops short of `/admin` on purpose: the token-protected admin REST API lives under `/admin/realms/<realm>` and services call it through the public hostname. Verified live: console/master 403, `/admin/realms/local/users` 401, login discovery 200, full scripted OIDC login green

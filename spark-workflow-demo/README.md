@@ -1,6 +1,6 @@
 # SPARK Workflow on AWS EKS — Demo Deployment
 
-Fully automated demo deployment of [SPARK Workflow](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow) (BMDS / Planungs- und Genehmigungsbeschleunigung — planning and permitting acceleration, EUPL-1.2) on Amazon EKS — open-source core, AWS managed services as the infrastructure foundation.
+Fully automated demo deployment of [SPARK Workflow](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow) (EUPL-1.2) on Amazon EKS — open-source core, AWS managed services as the infrastructure foundation.
 
 > **This is sample code, for non-production usage.** You should work with
 > your security and legal teams to meet your organizational security,

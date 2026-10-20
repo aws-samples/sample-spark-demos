@@ -1,6 +1,6 @@
 # SPARK API on AWS EKS — Demo Deployment
 
-Fully automated demo deployment of [SPARK API](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-api) (BMDS / planning and approval acceleration, EUPL-1.2) on Amazon EKS — open-source core, AWS managed services as the infrastructure foundation.
+Fully automated demo deployment of [SPARK API](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-api) (EUPL-1.2) on Amazon EKS — open-source core, AWS managed services as the infrastructure foundation.
 
 > **This is sample code, for non-production usage.** You should work with
 > your security and legal teams to meet your organizational security,

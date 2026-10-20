@@ -1,6 +1,6 @@
 # SPARK on AWS — Demo Deployments
 
-Automated demo deployments of the openCode projects [SPARK Workflow](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow) and [SPARK API](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-api) (BMDS, planning and approval acceleration) on Amazon EKS.
+Automated demo deployments of the openCode projects [SPARK Workflow](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow) and [SPARK API](https://gitlab.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-api) on Amazon EKS.
 
 > **This is sample code, for non-production usage.** You should work with
 > your security and legal teams to meet your organizational security,
