@@ -103,7 +103,7 @@ module "secrets" {
   s3_bucket_names          = module.s3.bucket_names
   s3_access_key_id         = module.s3.app_access_key_id
   s3_secret_access_key     = module.s3.app_secret_access_key
-  valkey_url               = var.valkey_enabled ? module.valkey[0].redis_url : null
+  valkey_url               = module.valkey.redis_url
   keycloak_demo_user_email = var.demo_user_email
   keycloak_host            = local.keycloak_fqdn
 
@@ -137,7 +137,6 @@ module "rds" {
 
 module "valkey" {
   source = "../../modules/elasticache-valkey"
-  count  = var.valkey_enabled ? 1 : 0
 
   name               = local.name
   vpc_id             = module.network.vpc_id
@@ -214,7 +213,6 @@ module "app_platform" {
   bedrock_region       = var.bedrock_region
   bedrock_vlm_model_id = var.bedrock_vlm_model_id
   vlm_model_name       = local.vlm_model_name
-  valkey_enabled       = var.valkey_enabled
 
   # Explicit module-level ordering: the platform chart's pre-install hooks
   # create ExternalSecrets, which the ESO validating webhook must admit —
@@ -228,12 +226,16 @@ module "app_workflow" {
   # Staged copy of the upstream charts (Makefile target `stage-charts`):
   # `helm dependency update` writes build artifacts (charts/, Chart.lock)
   # which must never dirty the submodule working tree.
-  umbrella_chart_path    = "${path.module}/../../../.build/spark-workflow-charts/00-spark-workflow"
+  umbrella_chart_path    = "${path.module}/../../../.build/spark-workflow-charts/00-umbrella/spark-platform"
   values_template_path   = "${path.module}/../../../helm/values/spark-workflow.demo.yaml.tftpl"
   postrender_script_path = abspath("${path.module}/../../../helm/postrender-spark-workflow.sh")
-  seed_jobs_chart_path   = "${path.module}/../../../helm/seed-jobs"
+  docling_chart_path     = "${path.module}/../../../helm/docling-rq"
 
-  app_namespace = module.k8s_addons.app_namespace
+  app_namespace          = module.k8s_addons.app_namespace
+  platform_namespace     = module.k8s_addons.platform_namespace
+  cluster_secret_store   = module.k8s_addons.cluster_secret_store_name
+  rds_master_secret_name = module.secrets.secret_names["rds_master"]
+  system_user_id         = module.app_platform.demo_user_id
 
   hosts = {
     frontend = local.frontend_fqdn
@@ -247,11 +249,10 @@ module "app_workflow" {
   region          = var.aws_region
   bucket_names    = module.s3.bucket_names
 
-  vlm_model_name    = local.vlm_model_name
-  valkey_enabled    = var.valkey_enabled
-  gpu_enabled       = var.gpu_enabled
-  seed_jobs_enabled = var.seed_jobs_enabled
+  vlm_model_name = local.vlm_model_name
+  gpu_enabled    = var.gpu_enabled
 
-  # Platform layer (Keycloak, LiteLLM, db-init, ExternalSecrets) must exist first.
+  # Platform layer (Keycloak, LiteLLM, SpiceDB, db roles, ExternalSecrets,
+  # routes) must exist first.
   depends_on = [module.app_platform]
 }

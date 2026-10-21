@@ -1,0 +1,271 @@
+# =============================================================================
+# docling-rq — values.yaml
+# =============================================================================
+#
+# Helm chart for the Docling-Serve RQ service. Bundles:
+#   - API server Deployment (docling-serve)
+#   - Worker Deployment(s) — one template, configurable per entry (CPU / GPU)
+#   - ClusterIP Service on port 5001
+#   - PodDisruptionBudget
+#   - Redis instance via the project redis subchart
+#
+# Kustomize source: repo/04-shared-services/llm/docling-rq/
+# Image source:     <container-registry>/infra/docling-serve-cu128
+#
+# =============================================================================
+
+# ── Naming / override ─────────────────────────────────────────────────────────
+nameOverride: ""
+fullnameOverride: ""
+namespaceOverride: ""
+
+# ── Feature flags ─────────────────────────────────────────────────────────────
+app:
+  enabled: true
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  repository: "ghcr.io/docling-project/docling-serve-cu128"
+  tag: "v1.14.3"
+  pullPolicy: Always
+
+# imagePullSecrets:          # Uncomment and set your registry pull secret name.
+#   - name: <registry-pull-secret>
+imagePullSecrets: []
+
+# ── Replicas (API server) ─────────────────────────────────────────────────────
+replicaCount: 1
+
+terminationGracePeriodSeconds: 120
+
+# ── Pod / container security contexts (API server) ───────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# ── Resources (API server) ───────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: "1"
+    memory: 8Gi
+  limits:
+    cpu: "4"
+    memory: 16Gi
+
+# ── Probe overrides ───────────────────────────────────────────────────────────
+startupProbe:
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 60
+
+livenessProbe:
+  periodSeconds: 30
+  timeoutSeconds: 15
+  failureThreshold: 5
+
+readinessProbe:
+  periodSeconds: 15
+  timeoutSeconds: 15
+  failureThreshold: 3
+
+# ── Pod annotations ──────────────────────────────────────────────────────────
+podAnnotations: {}
+
+# ── Labels ────────────────────────────────────────────────────────────────────
+# Extra labels applied to resources managed by this chart.
+# Use this map for any additional key-value labels.
+labels: {}
+
+# ── Stage ─────────────────────────────────────────────────────────────────────
+stage:
+  name: ""
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  enabled: true
+  ports:
+    - port: 80
+      targetPort: 5001
+      protocol: TCP
+      name: http
+  annotations: {}
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  ingressClassName: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+# ── HPA ───────────────────────────────────────────────────────────────────────
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: ""
+
+# ── PodDisruptionBudget ───────────────────────────────────────────────────────
+pdb:
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: ""
+
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+serviceAccount:
+  create: false
+  automount: false
+  name: ""
+  annotations: {}
+
+# ── Docling application configuration ────────────────────────────────────────
+# Shared by both the API server and all worker Deployments.
+docling:
+  # API server device (workers override this per-entry)
+  device: cpu
+  # RQ engine
+  engKind: rq
+  rqResultsTTL: "7200"
+  rqFailureTTL: "86400"
+  # Processing limits
+  maxDocumentTimeout: "3600"
+  maxSyncWait: "3600"
+  loadModelsAtBoot: "False"
+  numThreads: "4"
+  # Batch sizes — match kustomize defaults
+  perfPageBatchSize: "16"
+  perfElementsBatchSize: "16"
+  serveLayoutBatchSize: "48"
+  serveTableBatchSize: "4"
+  serveOcrBatchSize: "32"
+  # API server specifics
+  enableUI: "1"
+  uvicornTimeoutKeepAlive: "1800"
+
+# ── Worker Deployment ─────────────────────────────────────────────────────────
+# Single worker Deployment.  Node selection (nodeSelector + tolerations) routes
+# pods to the appropriate hardware.
+#
+# Defaults match the kustomize source (worker-deployment-gpu.yaml — CUDA/nvidia-l4).
+#
+# To run on CPU nodes instead, change:
+#   device: cpu
+#   extraEnv: []                          # remove LD_LIBRARY_PATH
+#   resources: cpu/memory only (no nvidia.com/gpu)
+#   nodeSelector: {}  |  tolerations: []
+#   podSecurityContext: (add seccomp + runAsNonRoot)
+#   securityContext: (add readOnlyRootFilesystem + drop ALL)
+worker:
+  enabled: true
+  replicaCount: 2
+  loadModelsAtBoot: "True"
+  terminationGracePeriodSeconds: 120
+
+  # DOCLING_DEVICE env var — "cuda:0" for GPU, "cpu" for CPU nodes.
+  # Demo default: CPU (the terraform app-workflow module switches these four
+  # keys to the GPU values when gpu_enabled=true).
+  device: "cpu"
+
+  # GPU nodes typically do not run with a hardened securityContext.
+  # Set these for CPU nodes with readOnlyRootFilesystem.
+  podSecurityContext: {}
+  securityContext: {}
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: 6Gi
+    limits:
+      cpu: "4"
+      memory: 16Gi
+
+  nodeSelector: {}
+
+  tolerations: []
+
+  # Additional env vars injected into the worker container
+  # (GPU: LD_LIBRARY_PATH=/usr/local/nvidia/lib64).
+  extraEnv: []
+
+# ── Redis URL reference ───────────────────────────────────────────────────────
+# DOCLING_SERVE_ENG_RQ_REDIS_URL is injected into every container.
+#
+# Default (redis.auth.enabled=false): the URL is constructed from the
+# Redis service name — no Secret is created or required.
+#
+# With authentication (redis.auth.enabled=true), set one of:
+#   a) secretName: ""  (empty) — the redis subchart creates the Secret; requires
+#      redis.auth.password or redis.auth.existingSecret to be set
+#   b) secretName: "my-secret"  key: "uri" — use a pre-existing Secret
+#      (ESO-managed or user-created)
+#
+# The docling-rq chart does NOT create or auto-generate any Redis password Secret.
+redisUrl:
+  secretName: ""
+  key: uri
+
+# ── Redis subchart ────────────────────────────────────────────────────────────
+# Wraps the project charts/sources/external/redis chart.
+# The fullnameOverride controls the Redis Service name used in the URL secret.
+#
+# Kustomize equivalent:
+#   oci://registry-1.docker.io/cloudpirates/redis  version 0.26.4
+#   Values: repo/04-shared-services/llm/docling-rq/redis/values-redis.yaml
+# The subchart is NOT bundled in this copy: the demo uses Amazon ElastiCache
+# for Valkey through redisUrl.secretName (ESO). Keys kept for the helpers.
+redis:
+  enabled: false
+  # nameOverride is combined with the release name: {release}-docling-rq-redis
+  nameOverride: "docling-rq-redis"
+
+  image:
+    registry: "docker.io"
+    repository: "redis"
+    tag: "8.6.1-alpine"
+    pullPolicy: IfNotPresent
+
+  # imagePullSecrets:          # Uncomment and set your registry pull secret name.
+  #   - name: <registry-pull-secret>
+  imagePullSecrets: []
+
+  auth:
+    enabled: false
+    # Supply a plaintext password (chart creates a Secret) or reference an existing one.
+    existingSecret: ""
+    # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name, not a value
+    existingSecretPasswordKey: redis-password
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 4Gi
+
+  persistence:
+    enabled: true
+    accessMode: ReadWriteOnce
+    size: 8Gi
+    storageClass: ""
+
+  service:
+    type: ClusterIP
+    port: 6379
+
+# ── Extra env vars ────────────────────────────────────────────────────────────
+env: []
+extraEnv: []

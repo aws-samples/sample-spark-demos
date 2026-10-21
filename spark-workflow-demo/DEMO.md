@@ -91,16 +91,17 @@ Useful context when the audience asks "what exactly is this?":
 
 - **SPARK Workflow** (openCode / BMDS, EUPL-1.2) — AI-assisted processing of
   plan approval procedures (Planfeststellungsverfahren). Charts and config in
-  this demo come from upstream `main` at commit `06019d4` (2026-08-11,
-  37 commits after the `v0.2.1` tag); the deployed **container images are
-  `v0.2.1`** — the newest published release images.
+  this demo come from the upstream release tag **v0.3.0** (2026-10-14); the
+  deployed container images are `v0.3.0` — the backend is one Bun application
+  (`spark-backend`) deployed as 15 pools, the AI modules stay separate.
 - This is an **early-stage product**: the UI covers procedure work (create,
   upload, AI analysis, results); user management, roles administration, and
   approval workflows are on the upstream roadmap (`docs/roadmap.md`), not in
   the app yet. Users live in Keycloak, master data is API-managed (see §11).
-- Two upstream modules are disabled in this demo because v0.2.1 ships no
-  images for them (`normenermittlung`, `landingpage`); flows that depend on
-  the proprietary Pharia Document Index are a documented functional gap.
+- Four upstream components are disabled in this demo because v0.3.0 ships no
+  images for them (`modul-normenermittlung`, `fallvergleichsservice`,
+  `landingpage`, `prototype-demo`); flows that depend on the proprietary
+  Pharia Document Index are a documented functional gap.
 - Upstream ships a German user manual and product brief in the submodule:
   `spark-workflow/docs/Benutzerhandbuch_GER_v1.pdf` and
   `Technischer_Produktsteckbrief_GER_v1.pdf`, plus feature lists
@@ -160,7 +161,7 @@ kubectl get pods -n spark -L spark-workflow.group/name --no-headers | awk '{prin
 
 # Platform layer & addons
 kubectl get pods -n spark-platform
-for ns in envoy-gateway-system cert-manager external-secrets external-dns spicedb-operator; do
+for ns in envoy-gateway-system cert-manager external-secrets external-dns; do
   echo "--- $ns"; kubectl get pods -n "$ns" --no-headers
 done
 ```
@@ -423,13 +424,15 @@ TOKEN=$(curl -s "${AUTH_URL}/realms/local/protocol/openid-connect/token" \
   -d username="$(echo "$KC" | jq -r .demo_user_email)" \
   -d password="$(echo "$KC" | jq -r .demo_user_password)" | jq -r .access_token)
 
-# Use it directly against the API (through Envoy):
-curl -s "${APP_URL}/api/identity/me" -H "Authorization: Bearer ${TOKEN}" | jq .
-curl -s "${APP_URL}/api/pls/v1/projects" -H "Authorization: Bearer ${TOKEN}" | jq '. | length'
+# Use it against a pool directly (the gateway sends every request without a
+# login session to the login page, Bearer or not; strict mode verifies the
+# token in the pool):
+kubectl -n spark port-forward svc/spark-identity-management-service 18000:80 &
+curl -s "http://localhost:18000/api/identity/me" -H "Authorization: Bearer ${TOKEN}" | jq .
+curl -s "http://localhost:18000/api/pls/v1/projects" -H "Authorization: Bearer ${TOKEN}" | jq '. | length'
 
-# SpiceDB is running and attached to RDS:
-kubectl get pods -n spark -l 'app.kubernetes.io/instance=spark-spicedb'
-kubectl get spicedbcluster -n spark 2>/dev/null || true
+# SpiceDB is running and attached to RDS (platform chart, no operator):
+kubectl get pods -n spark-platform -l 'app.kubernetes.io/name=spicedb'
 ```
 
 ### Adding a user (the upstream-intended way)

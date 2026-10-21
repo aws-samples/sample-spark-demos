@@ -1,0 +1,96 @@
+{{- if .Values.spicedb.enabled }}
+# SpiceDB — the authorization store every backend pool checks permissions
+# against (AUTH_SPICE_DB_ENDPOINT). Upstream 0.3.0 renders a SpiceDBCluster CR
+# for the authzed operator; the demo runs the server as a plain Deployment
+# against RDS instead (datastore_uri from Secrets Manager via ESO). The
+# backend's identity module writes the schema itself at startup, so no
+# operator-side schema step is needed; the init container only brings the
+# datastore to the current migration head (idempotent).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: spicedb-config
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { kind: ClusterSecretStore, name: {{ .Values.clusterSecretStore }} }
+  target: { name: spicedb-config }
+  data:
+    - secretKey: preshared_key
+      remoteRef: { key: {{ .Values.secretsManager.spicedb }}, property: preshared_key }
+    - secretKey: datastore_uri
+      remoteRef: { key: {{ .Values.secretsManager.rdsSpicedb }}, property: datastore_uri }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spicedb
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.spicedb.replicas }}
+  selector:
+    matchLabels: {{- include "spark-platform.selectorLabels" "spicedb" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-platform.selectorLabels" "spicedb" | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: migrate
+          image: {{ .Values.spicedb.image }}
+          args: ["datastore", "migrate", "head", "--datastore-engine=postgres"]
+          env:
+            - name: SPICEDB_DATASTORE_CONN_URI
+              valueFrom: { secretKeyRef: { name: spicedb-config, key: datastore_uri } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+      containers:
+        - name: spicedb
+          image: {{ .Values.spicedb.image }}
+          args:
+            - serve
+            - --datastore-engine=postgres
+            - --grpc-preshared-key=$(SPICEDB_GRPC_PRESHARED_KEY)
+            - --http-enabled=false
+            - --dashboard-enabled=false
+          env:
+            - name: SPICEDB_DATASTORE_CONN_URI
+              valueFrom: { secretKeyRef: { name: spicedb-config, key: datastore_uri } }
+            - name: SPICEDB_GRPC_PRESHARED_KEY
+              valueFrom: { secretKeyRef: { name: spicedb-config, key: preshared_key } }
+          ports:
+            - { name: grpc, containerPort: 50051 }
+            - { name: metrics, containerPort: 9090 }
+          readinessProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 10
+          livenessProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 30
+            failureThreshold: 3
+          resources: {{- toYaml .Values.spicedb.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spicedb
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-platform.selectorLabels" "spicedb" | nindent 4 }}
+  ports:
+    - { name: grpc, port: 50051, targetPort: grpc }
+{{- end }}

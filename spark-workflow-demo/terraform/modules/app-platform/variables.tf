@@ -92,8 +92,9 @@ variable "vlm_model_name" {
   type        = string
 }
 
-variable "valkey_enabled" {
-  description = "Whether the ElastiCache Valkey secret exists (docling-rq external broker)."
-  type        = bool
-  default     = true
+
+variable "demo_user_id" {
+  description = "Keycloak id of the demo user created by the bootstrap job; the backend pools record it as SYSTEM_USER_ID."
+  type        = string
+  default     = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 }

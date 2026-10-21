@@ -1,30 +1,45 @@
 # =============================================================================
-# Demo overlay for the upstream 00-spark-workflow umbrella (rendered by
-# terraform templatefile() in the app-workflow module).
+# Demo overlay for the upstream spark-platform umbrella (spark-workflow
+# v0.3.0, helm/charts/00-umbrella/spark-platform), rendered by terraform
+# templatefile() in the app-workflow module.
 #
 # Wiring targets:
-#   - RDS PostgreSQL:   ${rds_host}:${rds_port} (per-service DB_HOST/DB_PORT,
-#                       DB names = upstream umbrella defaults)
+#   - RDS PostgreSQL:   ${rds_host}:${rds_port}; ONE application database for
+#                       the 15 backend pools (0.3.0 modulith), one per agent
+#                       data service, temporal + visibility, spicedb, keycloak
 #   - Amazon S3:        ${s3_endpoint} (dms/temporal/archival/quarantine buckets)
 #   - LiteLLM gateway:  ${litellm_url} (models: self-hosted/gpt-oss-120b via
 #                       Bedrock, self-hosted/bge-m3 via in-cluster TEI)
-#   - Keycloak:         https://${keycloak_host} (realm ${keycloak_realm})
-#   - docling-rq:       CPU image%{ if valkey_enabled }, broker = ElastiCache Valkey via
-#                       docling-rq-redis-url secret%{ endif }
+#   - Keycloak:         https://${keycloak_host} (realm ${keycloak_realm}),
+#                       perimeter login by the platform chart's Envoy routes
+#   - SpiceDB:          ${spicedb_endpoint} (platform chart, no operator)
+#   - Qdrant:           ${qdrant_host} (official chart, app-workflow module)
+#   - Docling:          ${docling_host} (docling-rq chart, app-workflow module)
+#
+# Everything is installed into ONE namespace (${app_namespace}); the upstream
+# defaults spread the layers over backend-services / agent-services /
+# frontend-services, which would multiply the ExternalSecrets and the
+# cross-namespace references for no demo benefit.
 #
 # Secret names referenced here are created as ExternalSecrets by the
 # spark-platform chart (appSecrets) from AWS Secrets Manager.
 # =============================================================================
 
 global:
+  namespaceOverride: "${app_namespace}"
+  stage:
+    name: ""
+  # Lists are REPLACED by Helm, so upstream's AUTH_* block is re-listed here
+  # (every container, backend pools and agent modules alike).
   extraEnv:
     - name: AUTH_AUDIENCE
       value: "${keycloak_client_id}"
     - name: AUTH_BASE_URL
       value: "https://${keycloak_host}"
-    # Demo default: perimeter login via Envoy Gateway OIDC; service-level JWT
-    # enforcement disabled exactly like the upstream local stack. Documented
-    # deviation — switch to "strict" once token forwarding is verified.
+    # 0.3.0 accepts "disabled" or "strict" only (the 0.2.x dry-run mode is
+    # gone). strict: the Bearer token Envoy forwards after the perimeter
+    # login is verified by every pool, SpiceDB permission checks are
+    # enforced.
     - name: AUTH_MODE
       value: "${auth_mode}"
     - name: AUTH_ALLOWED_MACHINE_IDENTITIES
@@ -32,7 +47,7 @@ global:
     - name: AUTH_REALM
       value: "${keycloak_realm}"
     - name: AUTH_SPICE_DB_ENDPOINT
-      value: "${release_name}-spicedb.${app_namespace}.svc.cluster.local:50051"
+      value: "${spicedb_endpoint}"
     - name: AUTH_SPICE_DB_INSECURE
       value: "true"
     - name: AUTH_SPICE_DB_TOKEN
@@ -40,835 +55,1055 @@ global:
         secretKeyRef:
           name: spicedb-config
           key: preshared_key
+    # Agent modules post workflow status here (packages/temporal/python);
+    # 0.3.0 ships no value for it anywhere in the charts and four modules
+    # refuse to start without it. The temporal-job pool serves it under /api;
+    # the call goes through the machine-identity proxy (platform chart),
+    # because the pools run AUTH_MODE=strict and the modules carry no token.
     - name: TEMPORAL_JOB_SERVICE_URL
-      value: '{{ printf "http://%s-temporal-job-service.%s.svc.cluster.local" .Release.Name .Release.Namespace }}'
+      value: "${machine_identity_proxy}/api"
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Basisdienste
+# Platform-level switches (spark-platform/values.yaml)
 # ---------------------------------------------------------------------------
-basisdienste:
+# Our own HTTPRoutes/SecurityPolicies in the platform chart replace this
+# chart: its OIDC back-channel targets the PUBLIC Keycloak host on 443 (the
+# NLB hairpin that fails from the Envoy pods) and it needs a second
+# confidential client. Design decision 2026-10-20 (design.md).
+gateway-routes:
+  enabled: false
+# Cloud SQL proxy / pgbouncer: RDS is reached directly.
+db-proxy:
+  enabled: false
+# No published image (openCode registry has no landingpage repository).
+landingpage:
+  enabled: false
+# No published image (registry has no fallvergleichsservice repository).
+fallvergleichsservice:
+  enabled: false
+# No published image (norm-tbm-spec-module), as in 0.2.x.
+modul-normenermittlung:
+  enabled: false
+# Provider-specific LLM queues: every model name the demo uses is
+# self-hosted/* and routes to the llm-custom queue (agent-services.llm-client).
+# The ionos queue stays on for the EWMS extraction path, whose OCR model name
+# is a code constant (ionos/lightonocr-2-1b); LiteLLM serves that name too.
+llm-client-vertex:
+  enabled: false
+llm-client-mistral:
+  enabled: false
+llm-client-nvidia:
+  enabled: false
+llm-client-huggingface:
+  enabled: false
+llm-client-ionos:
   enabled: true
-
-  spicedb:
-    cluster:
-      # No CNPG cluster: SpiceDB persists to Amazon RDS via the datastore_uri
-      # in the spicedb-config secret (ESO). The CNPG operator is not installed.
-      database:
-        enabled: false
-
-  clamav:
-    persistence:
-      # Chart default "" disables dynamic provisioning — bind to gp3.
-      storageClass: gp3
-
-  qdrant:
-    qdrant:
-      # Dedicated tainted node pool (terraform eks module).
-      nodeSelector:
-        spark-demo/pool: qdrant
-      tolerations:
-        - key: dedicated
-          operator: Equal
-          value: qdrant
-          effect: NoSchedule
-      persistence:
-        storageClassName: gp3
-
-  docling-rq:
-    # Demo default: CPU mode (documented deviation; GPU via terraform flag).
-    image:
-      repository: "${docling_image}"
-      tag: "${docling_tag}"
-    worker:
-      replicaCount: 1
-      device: "${docling_device}"
-      resources:
-        requests:
-          cpu: "1"
-          memory: 6Gi
-        limits:
-          cpu: "4"
-          memory: 16Gi
-%{ if gpu_enabled ~}
-      nodeSelector:
-        spark-demo/pool: gpu
-      tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
-%{ else ~}
-      # null (not {}): Helm merges maps — only null removes the
-      # GKE GPU nodeSelector from the chart defaults.
-      nodeSelector: null
-      tolerations: []
-      extraEnv: []
-%{ endif ~}
-%{ if valkey_enabled ~}
-    # Amazon ElastiCache for Valkey replaces the embedded Redis container.
-    redis:
-      enabled: false
-    redisUrl:
-      secretName: docling-rq-redis-url
-      key: uri
-%{ endif ~}
-
-# ---------------------------------------------------------------------------
-# Layer 2 — Frontend
-# ---------------------------------------------------------------------------
-frontend-layer:
-  enabled: true
-  # Placeholder-only chart without a published image (v0.2.1) — out of scope.
-  landingpage:
-    enabled: false
-  frontend:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    # Demo deviation (documented): the v0.2.1 image templates VITE_* into
-    # /usr/share/nginx/html at startup and binds port 80 — both require root
-    # in this image build. Upstream chart defaults (uid 65532) crash-loop.
-    podSecurityContext:
-      runAsNonRoot: false
-      runAsUser: 0
-      runAsGroup: 0
-      fsGroup: 0
-    securityContext:
-      allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: false
-      capabilities:
-        drop: []
-        add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
-    extraEnv:
-      - name: VITE_API_BASE_URL
-        value: "/api"
-      - name: VITE_APP_BASE_PATH
-        value: "/app"
-      - name: VITE_ENABLE_EWMS_FEATURE
-        value: "true"
-      - name: VITE_ENABLE_MAINTENANCE_MODE
-        value: "false"
-      - name: VITE_SENTRY_DSN
-        value: ""
-      - name: VITE_SENTRY_ENVIRONMENT
-        value: "demo"
-      - name: VITE_TEMPORAL_UI_BASE_URL
-        value: "https://${temporal_host}/namespaces/default/workflows"
-      # SPA-side security allowlists for presigned S3 URLs: the frontend
-      # refuses to PUT/GET storage URLs whose origin is not listed here
-      # (uploadUrlSafety.ts/downloadUrlSafety.ts). Without these, every
-      # upload fails CLIENT-side before any request is sent (observed:
-      # "Hochladen fehlgeschlagen" while generate-upload-url succeeded and
-      # S3/CORS never saw a request).
-      - name: VITE_ALLOWED_UPLOAD_ORIGINS
-        value: "${s3_endpoint}"
-      - name: VITE_ALLOWED_DOWNLOAD_ORIGINS
-        value: "${s3_endpoint}"
-
-# ---------------------------------------------------------------------------
-# Layer 3 — Service Layer
-# ---------------------------------------------------------------------------
-service-layer:
-  enabled: true
-  project-logic-service:
-    extraEnv:
-    - name: DB_NAME
-      value: project_logic_service
-    - name: TEMPORAL__S3_ACCESS_KEY_ID
-      valueFrom:
-        secretKeyRef:
-          name: temporal-s3-secrets
-          key: TEMPORAL_S3_ACCESS_KEY_ID
-    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
-      valueFrom:
-        secretKeyRef:
-          name: temporal-s3-secrets
-          key: TEMPORAL_S3_SECRET_ACCESS_KEY
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: PROJECT_LOGIC_SERVICE_CORS_ORIGINS
-      value: https://${frontend_host}
-    - name: TEMPORAL__S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL__S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL__S3_REGION
-      value: "${region}"
-  temporal-job-service:
-    # Chart default startupProbe allows 60 s (6 x 10 s); at cold start the
-    # alembic migration plus the Temporal connect take about that long under
-    # the 150m CPU limit (observed: both replicas killed by the startup probe
-    # 5-6 times, "connection refused" on /startup, uvicorn up right when the
-    # SIGTERM arrived; Ready after 7 min). Map merge keeps the chart's httpGet.
-    startupProbe:
-      failureThreshold: 30
-    extraEnv:
-    - name: DB__NAME
-      value: temporal_job_service
-    - name: DB__USER
-      valueFrom:
-        secretKeyRef:
-          name: temporal-job-service-db-user
-          key: username
-    - name: DB__PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: temporal-job-service-db-user
-          key: password
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: DB__HOST
-      value: "${rds_host}"
-    - name: TEMPORAL__S3_ARCHIVAL_BUCKET_NAME
-      value: "${bucket_archival}"
-    - name: TEMPORAL__S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL__S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL__S3_REGION
-      value: "${region}"
-    - name: TEMPORAL__S3_ACCESS_KEY_ID
-      valueFrom:
-        secretKeyRef:
-          name: temporal-s3-secrets
-          key: TEMPORAL_S3_ACCESS_KEY_ID
-    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
-      valueFrom:
-        secretKeyRef:
-          name: temporal-s3-secrets
-          key: TEMPORAL_S3_SECRET_ACCESS_KEY
-  document-management-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: document_management_service
-    - name: TEMPORAL__S3_ACCESS_KEY_ID
-      valueFrom:
-        secretKeyRef:
-          name: temporal-s3-secrets
-          key: TEMPORAL_S3_ACCESS_KEY_ID
-    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
-      valueFrom:
-        secretKeyRef:
-          name: temporal-s3-secrets
-          key: TEMPORAL_S3_SECRET_ACCESS_KEY
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
+  image:
+    repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/llm-client
+    tag: "v0.3.0"
+    pullPolicy: IfNotPresent
+  # Worker probes (shared anchors): an ESTABLISHED connection to the Temporal
+  # frontend, port 7233 = 0x1C41 in /proc/1/net/tcp. The v0.3.0 images run
+  # on a shell-less minimal base (observed from zero: every exec probe with
+  # `sh -c` errored "executable file not found", 0/1 Ready, restart every
+  # 10 min) — the check runs in the image's own python.
+  startupProbe: &temporalWorkerStartupProbe
+    exec:
+      command: ["python", "-c", "import sys; sys.exit(0 if ':1C41 01' in open('/proc/1/net/tcp').read().upper() else 1)"]
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
+  livenessProbe: &temporalWorkerLivenessProbe
+    exec:
+      command: ["python", "-c", "import sys; sys.exit(0 if ':1C41 01' in open('/proc/1/net/tcp').read().upper() else 1)"]
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  extraEnv:
     - name: ENV
       value: production
-    - name: BUCKET_NAME
-      value: "${bucket_dms}"
-    - name: CORS_ORIGINS
-      value: https://${frontend_host}
-    - name: QUARANTINE_BUCKET_NAME
-      value: "${bucket_quarantine}"
-    - name: QUARANTINE_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: S3_EXTERNAL_URL
-      value: "${s3_endpoint}"
-    - name: S3_REGION
-      value: "${region}"
-    - name: TEMPORAL__S3_BUCKET_NAME
+    - name: QUEUE_NAME
+      value: llm-ionos
+    - name: QUEUE_MAX_CONCURRENT
+      value: "4"
+    - name: QUEUE_MAX_PER_SECOND
+      value: "10"
+    - name: LITELLM_BASE_URL
+      value: "${litellm_url}"
+    - name: LITELLM_MASTER_KEY
+      valueFrom:
+        secretKeyRef:
+          name: litellm-proxy-credentials
+          key: LITELLM_MASTER_KEY
+    - name: OTEL_ENDPOINT
+      value: "${otel_endpoint}"
+    - name: TEMPORAL_HOST
+      value: "${temporal_frontend}"
+    - name: TEMPORAL_S3_BUCKET_NAME
       value: "${bucket_temporal}"
-    - name: TEMPORAL__S3_ENDPOINT_URL
+    - name: TEMPORAL_S3_ENDPOINT_URL
       value: "${s3_endpoint}"
-    - name: TEMPORAL__S3_REGION
+    - name: TEMPORAL_S3_REGION
       value: "${region}"
-  agent-orchestration-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: TEMPORAL__S3_ACCESS_KEY_ID
+    - name: TEMPORAL_S3_ACCESS_KEY_ID
       valueFrom:
         secretKeyRef:
           name: temporal-s3-secrets
           key: TEMPORAL_S3_ACCESS_KEY_ID
-    - name: TEMPORAL__S3_SECRET_ACCESS_KEY
+    - name: TEMPORAL_S3_SECRET_ACCESS_KEY
       valueFrom:
         secretKeyRef:
           name: temporal-s3-secrets
           key: TEMPORAL_S3_SECRET_ACCESS_KEY
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: CORS_ORIGINS
-      value: https://${frontend_host}
-    - name: TEMPORAL__S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL__S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL__S3_REGION
-      value: "${region}"
-  administrative-file-draft:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: administrative_file_draft
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-  comment-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: comment_service
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-  examination-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: examination_service
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: BACKEND_CORS_ORIGINS
-      value: https://${frontend_host}
-  feedback-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: feedback_service
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-  formal-completeness-check:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: formal_completeness_check
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: CORS_ORIGINS
-      value: https://${frontend_host}
-  fpp-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: fpp_service
-    - name: FPP_ALLOWED_DOMAINS
-      value: ''
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: BACKEND_CORS_ORIGINS
-      value: https://${frontend_host}
-  llm-client:
-    # Temporal worker for the llm-custom queue (every Bedrock call); same
-    # silent cold-start death as the AI modules — see ai-module-layer below.
-    startupProbe:
-      exec:
-        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
-      periodSeconds: 10
-      failureThreshold: 60
-    livenessProbe:
-      exec:
-        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
-      periodSeconds: 30
-      timeoutSeconds: 5
-      failureThreshold: 3
-    extraEnv:
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: LITELLM_BASE_URL
-      value: "${litellm_url}"
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  identity-management-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: identity_management_service
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: AUTH_BASE_URL
-      value: https://${keycloak_host}
-    - name: AUTH_PRIVILEGED_REALM
-      value: "${keycloak_realm}"
-    - name: AUTH_PRIVILEGED_CLIENT_ID
-      value: "${keycloak_client_id}"
-    # Admin-API client for GET /users (client_credentials). Without
-    # AUTH_CLIENT_ID the token request fails and /users returns 500 —
-    # the shared lib does not fall back to AUTH_AUDIENCE here.
-    - name: AUTH_CLIENT_ID
-      value: "${keycloak_client_id}"
-    - name: AUTH_CLIENT_SECRET
-      valueFrom:
-        secretKeyRef:
-          name: keycloak-client
-          key: client_secret
-    - name: AUTH_PRIVILEGED_CLIENT_SECRET
-      valueFrom:
-        secretKeyRef:
-          name: keycloak-client
-          key: client_secret
-  objections-management-service:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: objections_management_service
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-  plausibility-notes:
-    # Published 0.2.3 image (upstream charts still default to v0.2.1); see
-    # README section E for the per-service tag matrix.
-    image:
-      tag: "v0.2.3"
-    extraEnv:
-    - name: DB_NAME
-      value: plausibility_notes
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: CORS_ORIGINS
-      value: https://${frontend_host}
-  supplementary-requests-service:
-    extraEnv:
-    - name: DB_NAME
-      value: supplementary_requests_service
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: SUPPLEMENTARY_REQUESTS_SERVICE_CORS_ORIGINS
-      value: https://${frontend_host}
-  protocol-service:
-    extraEnv:
-    # The chart renders every per-source *_DB_HOST as an EMPTY env (no
-    # value, no secret ref); pydantic accepts "" and asyncpg then fails
-    # with OSError — readiness stays 503 forever, reported only for the
-    # first source checked (observed: pod 0/1 with "Database check failed
-    # for source 'project_logic'"). Point all sources at RDS explicitly.
-    - name: ADMINISTRATIVE_DRAFT_DB_HOST
-      value: "${rds_host}"
-    - name: COMMENT_DB_HOST
-      value: "${rds_host}"
-    - name: DOCUMENT_MANAGEMENT_DB_HOST
-      value: "${rds_host}"
-    - name: EXAMINATION_DB_HOST
-      value: "${rds_host}"
-    - name: FORMAL_COMPLETENESS_DB_HOST
-      value: "${rds_host}"
-    - name: OBJECTIONS_MANAGEMENT_DB_HOST
-      value: "${rds_host}"
-    - name: PLAUSIBILITY_DB_HOST
-      value: "${rds_host}"
-    - name: PROJECT_LOGIC_DB_HOST
-      value: "${rds_host}"
-    - name: SUPPLEMENTARY_DB_HOST
-      value: "${rds_host}"
-    - name: ADMINISTRATIVE_DRAFT_DB_NAME
-      value: administrative_file_draft
-    - name: COMMENT_DB_NAME
-      value: comment_service
-    - name: DOCUMENT_MANAGEMENT_DB_NAME
-      value: document_management_service
-    - name: EXAMINATION_DB_NAME
-      value: examination_service
-    - name: FORMAL_COMPLETENESS_DB_NAME
-      value: formal_completeness_check
-    - name: OBJECTIONS_MANAGEMENT_DB_NAME
-      value: objections_management_service
-    - name: PLAUSIBILITY_DB_NAME
-      value: plausibility_notes
-    - name: PROJECT_LOGIC_DB_NAME
-      value: project_logic_service
-    - name: SUPPLEMENTARY_DB_NAME
-      value: supplementary_requests_service
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: PROTOCOL_SERVICE_CORS_ORIGINS
-      value: https://${frontend_host}
-  rechtsaenderungs-monitoring:
-    extraEnv:
-    - name: DB_NAME
-      value: rechtsaenderungs_monitoring
-    - name: OTEL_ENDPOINT
-      value: ''
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  gesetze-normen-db-service:
-    extraEnv:
-    - name: DB_NAME
-      value: gesetze_normen
-    - name: OTEL_ENDPOINT
-      value: ''
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  jura-db-service:
-    extraEnv:
-    - name: CHUNKING_APIKEY
-      valueFrom:
-        secretKeyRef:
-          name: litellm-proxy-credentials
-          key: master-key
-    - name: DB_NAME
-      value: jura
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: CHUNKING_URL
-      value: "${litellm_url}"
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  gesetzesbegruendung-db-service:
-    extraEnv:
-    - name: CHUNKING_APIKEY
-      valueFrom:
-        secretKeyRef:
-          name: litellm-proxy-credentials
-          key: master-key
-    - name: DB_NAME
-      value: gesetzesbegruendung
-    - name: DOCLING_CLIENT_ID
-      valueFrom:
-        secretKeyRef:
-          name: docling-keycloak-secrets
-          key: KEYCLOAK_CLIENT_ID
-    - name: DOCLING_CLIENT_SECRET
-      valueFrom:
-        secretKeyRef:
-          name: docling-keycloak-secrets
-          key: KEYCLOAK_CLIENT_SECRET
-    - name: DB_HOST
-      value: "${rds_host}"
-    - name: DB_PORT
-      value: "${rds_port}"
-    - name: CHUNKING_URL
-      value: "${litellm_url}"
-    # Service port 80 (targetPort 5001); port 5001 on the ClusterIP times out.
-    - name: DOCLING_HOST
-      value: '{{ printf "http://%s-docling-rq.%s.svc.cluster.local" .Release.Name .Release.Namespace }}'
-    - name: DOCLING_TOKEN_URL
-      value: https://${keycloak_host}/realms/${keycloak_realm}/protocol/openid-connect/token
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-# ---------------------------------------------------------------------------
-# Layer 4 — Orchestration (Temporal → RDS)
-# ---------------------------------------------------------------------------
-orchestration-layer:
-  enabled: true
-  temporal:
-    temporal:
-      # The wrapper disables schema management ("managed externally via
-      # CNPG"); on RDS the databases exist but are empty — enable the
-      # official chart's schema setup/update jobs. createDatabase stays off
-      # (databases are created by the platform db-init job with the right
-      # ownership).
-      schema:
-        createDatabase:
-          enabled: false
-        setup:
-          enabled: true
-        update:
-          enabled: true
-      web:
-        additionalEnv:
-          - name: TEMPORAL_CORS_ORIGINS
-            value: "https://${frontend_host}"
-      server:
-        config:
-          # Auto-create the "default" Temporal namespace (the wrapper leaves
-          # creation off; the search-attributes hook blocks until it exists).
-          namespaces:
-            create: true
-          persistence:
-            default:
-              sql:
-                host: "${rds_host}"
-                user: "spark_temporal"
-                existingSecret: "temporal-db-credentials"
-            visibility:
-              sql:
-                host: "${rds_host}"
-                user: "spark_temporal"
-                existingSecret: "temporal-db-credentials"
 
 # ---------------------------------------------------------------------------
-# Layer 5 — AI Modules
-# LiteLLM serves the exact model names the umbrella defaults reference
-# (self-hosted/gpt-oss-120b, self-hosted/bge-m3) — no per-module overrides.
+# environment-config (03-infrastructure): per-environment plumbing
 # ---------------------------------------------------------------------------
-ai-module-layer:
+environment-config:
   enabled: true
-  inhaltsextraktion:
-    # Temporal workers die silently at cold start: the module connects to the
-    # Temporal frontend once at startup, a refused connection ends the worker
-    # coroutine with a traceback, but the process (and its health server) stays
-    # up, so the pod reads Running/Ready while nothing polls its task queue
-    # (observed: all 16 module pods and llm-client after `make apply` from
-    # zero, `temporal task-queue describe` showed zero pollers for 30 min;
-    # a `rollout restart` fixed each one). The upstream charts expose no
-    # worker-health endpoint and no init-container hook, so the probes test
-    # the one observable fact: an established connection to the frontend
-    # (port 7233 = 0x1C41 in /proc/<pid>/net/tcp). The startup window is
-    # generous because inhaltsextraktion downloads two tokenizers from the
-    # Hugging Face Hub first (observed: 6 min).
-    startupProbe: &temporalWorkerStartupProbe
-      exec:
-        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
-      periodSeconds: 10
-      failureThreshold: 60
-    livenessProbe: &temporalWorkerLivenessProbe
-      exec:
-        command: ["sh", "-c", "grep -q -i ':1C41 01' /proc/1/net/tcp"]
-      periodSeconds: 30
-      timeoutSeconds: 5
-      failureThreshold: 3
-    extraEnv:
-    # The published v0.2.1 image sets TRANSFORMERS_OFFLINE=1 but does not
-    # contain the expected pre-baked model cache (upstream gap, issue to
-    # follow) — online mode allows the anonymous HF download at startup.
-    - name: TRANSFORMERS_OFFLINE
-      value: "0"
-    - name: HF_HUB_OFFLINE
-      value: "0"
-    # Non-root without HOME: the default cache "/.cache" is not writable.
-    - name: HF_HOME
-      value: /tmp/hf
-    - name: METADATA_MODEL_NAME
-      value: self-hosted/gpt-oss-120b
-    - name: SCHWERPUNKTTHEMA_MODEL_NAME
-      value: self-hosted/gpt-oss-120b
-    - name: STRUCTURE_MODEL_NAME
-      value: self-hosted/gpt-oss-120b
-    - name: SUMMARIZATION_MODEL_NAME
-      value: self-hosted/gpt-oss-120b
-    - name: VLM_SUMMARY_MODEL_NAME
-      value: self-hosted/gpt-oss-120b
-    # Deviation from the upstream default (self-hosted/gpt-oss-120b): the
-    # VLM stage sends image content blocks, gpt-oss-120b is text-only —
-    # observed: Bedrock 400 "This model doesn't support the image content
-    # block" on every element, vlm-batch-processing fails the document.
-    # Served by LiteLLM as a vision-capable Bedrock model (EU profile).
-    - name: VLLM_MODEL
-      value: "${vlm_model_name}"
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
+  # The otel-collector (debug exporter) gives every OTEL_ENDPOINT a real
+  # target; 0.2.x pointed the modules at a localhost port nobody served.
+  otel:
+    enabled: true
+    # The backend pools export metrics every 10 s; with the chart default
+    # (traces only) the collector answers Unimplemented and every pool logs a
+    # warning each time (observed from zero). The debug exporter accepts them.
+    pipelines:
+      metrics: true
+  # SpiceDB runs as a plain Deployment in the platform chart; the
+  # SpiceDBCluster CR would need the authzed operator in the cluster.
+  spicedb:
+    enabled: false
+  # The default policies allow egress to 53/443 and 5432 into 10.0.0.0/8
+  # only: Keycloak/LiteLLM/SpiceDB in the platform namespace, Valkey (6379)
+  # and the Bedrock endpoint stay unreachable. Demo trade-off, THREAT-MODEL R-2.
+  networkPolicy:
+    enabled: false
+  # ExternalSecrets are rendered by the platform chart (appSecrets); two
+  # owners of the same Secret would fight.
+  externalSecrets:
+    secrets: {}
+  serviceAccount:
+    create: true
+
+# ---------------------------------------------------------------------------
+# db-init (03-infrastructure): the application's databases
+# ---------------------------------------------------------------------------
+# Owner roles (spark_app, spark_temporal) are created by the platform chart's
+# db-roles job before this release; db-init creates no roles by design. The
+# platform layer's own databases (keycloak, spicedb, gesetze_normen with its
+# upstream seed) are created there too, because Keycloak starts before this
+# release and the seed dump needs the psql-17 directives stripped.
+db-init:
+  enabled: true
+  images:
+    postgres: public.ecr.aws/docker/library/postgres:16-bookworm
+  connection:
+    host: "${rds_host}"
+    port: ${rds_port}
+    sslmode: require
+  admin:
+    secretStore:
+      name: "${cluster_secret_store}"
+      kind: ClusterSecretStore
+    remoteKey: "${rds_master_secret}"
+    usernameProperty: username
+    passwordProperty: password
+  guard:
+    # The default pattern requires every name to start with "<stage>-"; the
+    # demo has one dedicated RDS instance and keeps the upstream-local names.
+    namePattern: ""
+  defaults:
+    owner: spark_app
+    create: true
+  databases:
+    application:
+      name: application
+      extensions: [vector]
+    temporal:
+      name: temporal
+      owner: spark_temporal
+    temporalVisibility:
+      name: temporal_visibility
+      owner: spark_temporal
+    jura:
+      name: jura
+      extensions: [vector]
+    gesetzesbegruendung:
+      name: gesetzesbegruendung
+      extensions: [vector]
+    rechtsaenderungsMonitoring:
+      name: rechtsaenderungs_monitoring
+      extensions: [vector]
+    rechtsbegriffe:
+      name: rechtsbegriffe
+      extensions: [vector]
+
+# ---------------------------------------------------------------------------
+# Shared services under spark-platform
+# ---------------------------------------------------------------------------
+temporal:
+  enabled: true
+  searchAttributesJob:
+    enabled: true
+  temporal:
+    server:
+      config:
+        persistence:
+          datastores:
+            default:
+              sql:
+                connectAddr: "${rds_host}:${rds_port}"
+                databaseName: temporal
+                user: spark_temporal
+                existingSecret: temporal-db-credentials
+                secretKey: password
+                createDatabase: false
+                manageSchema: true
+            visibility:
+              sql:
+                connectAddr: "${rds_host}:${rds_port}"
+                databaseName: temporal_visibility
+                user: spark_temporal
+                existingSecret: temporal-db-credentials
+                secretKey: password
+                createDatabase: false
+                manageSchema: true
+    web:
+      additionalEnv:
+        - name: TEMPORAL_CORS_ORIGINS
+          value: "https://${frontend_host}"
+
+unoserver:
+  enabled: true
+  image:
+    repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/unoserver
+    tag: "3.5"
+
+clamav:
+  enabled: true
+  image:
+    # The upstream chart names an internal mirror of this public image.
+    repository: ghcr.io/devhatro/clamav-api
+    tag: "v2.0.0"
+  persistence:
+    storageClass: gp3
+
+modul-risikohinweiser:
+  enabled: true
+  image:
+    repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-risikohinweiser
+    tag: "v0.3.0"
+    pullPolicy: IfNotPresent
+  startupProbe: *temporalWorkerStartupProbe
+  livenessProbe: *temporalWorkerLivenessProbe
+  extraEnv:
     - name: LITELLM_BASE_URL
       value: "${litellm_url}"
-    - name: INJECTION_MODEL_URL
-      value: 'http://localhost:9999/predict'
-    - name: KEYCLOAK_TOKEN_URL
-      value: https://${keycloak_host}/realms/${keycloak_realm}/protocol/openid-connect/token
-    - name: DOCLING_HOST
-      value: '{{ printf "%s-docling-rq.%s.svc.cluster.local" .Release.Name .Release.Namespace }}'
-    # Upstream default: Service port 80 (targetPort 5001). 5001 on the
-    # ClusterIP is not programmed by kube-proxy → ConnectTimeout on submit.
-    - name: DOCLING_PORT
-      value: '80'
-    - name: DOCLING_PROTOCOL
-      value: http
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  formale-vollstaendigkeitspruefung:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    extraEnv:
     - name: LITELLM_MODEL
       value: self-hosted/gpt-oss-120b
     - name: OTEL_ENDPOINT
-      value: http://localhost:4317
+      value: "${otel_endpoint}"
+    - name: TEMPORAL_HOST
+      value: "${temporal_frontend}"
     - name: TEMPORAL_S3_BUCKET_NAME
       value: "${bucket_temporal}"
     - name: TEMPORAL_S3_ENDPOINT_URL
       value: "${s3_endpoint}"
     - name: TEMPORAL_S3_REGION
       value: "${region}"
-  plausibilitaetspruefung:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    replicaCount: 2
-    extraEnv:
-    - name: LITELLM_MODEL
-      value: self-hosted/gpt-oss-120b
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  materielle-vollstaendigkeitspruefung:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    extraEnv:
-    - name: LLM_DB_RESEARCH_MODEL
-      value: self-hosted/gpt-oss-120b
-    - name: LLM_EMBEDDING_MODEL
-      value: self-hosted/bge-m3
-    - name: LLM_PAGEINDEX_SVM_MODEL_STAGE1
-      value: self-hosted/gpt-oss-120b
-    - name: LLM_PAGEINDEX_SVM_MODEL_STAGE2
-      value: self-hosted/gpt-oss-120b
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  einwendungsmanagement:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    extraEnv:
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  rechtliche-pruefung-und-bewertung:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    extraEnv:
-    - name: LITELLM_MODEL
-      value: self-hosted/gpt-oss-120b
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  rechtsmethodik:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    extraEnv:
-    - name: MODELS_LARGE_LLM
-      value: self-hosted/gpt-oss-120b
-    - name: MODELS_MEDIUM_LLM
-      value: self-hosted/gpt-oss-120b
-    - name: MODELS_SMALL_LLM
-      value: self-hosted/gpt-oss-120b
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  anonymisierung:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    extraEnv:
-    - name: LLM_MODEL
-      value: self-hosted/gpt-oss-120b
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
-    - name: TEMPORAL_S3_REGION
-      value: "${region}"
-  normenermittlung:
-    enabled: false
-  risikohinweiser:
-    startupProbe: *temporalWorkerStartupProbe
-    livenessProbe: *temporalWorkerLivenessProbe
-    extraEnv:
-    - name: OTEL_ENDPOINT
-      value: http://localhost:4317
-    - name: LITELLM_MODEL
-      value: self-hosted/gpt-oss-120b
-    - name: TEMPORAL_S3_BUCKET_NAME
-      value: "${bucket_temporal}"
-    - name: TEMPORAL_S3_ENDPOINT_URL
-      value: "${s3_endpoint}"
+
+# ---------------------------------------------------------------------------
+# spark-environment: backend pools, agent modules, frontend
+# ---------------------------------------------------------------------------
+spark-environment:
+  enabled: true
+  global:
+    namespaceOverride: "${app_namespace}"
+    backend:
+      namespaceOverride: "${app_namespace}"
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/spark-backend
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      # Non-secret configuration of every pool (ConfigMap, envFrom). Every
+      # pool parses the env of EVERY feature at startup, so the whole
+      # required set is here (reference: upstream process-compose.yaml).
+      config:
+        ENV: production
+        HOST: 0.0.0.0
+        PORT: "8000"
+        DB_HOST: "${rds_host}"
+        DB_MIGRATE_HOST: "${rds_host}"
+        DB_PORT: "${rds_port}"
+        DB_NAME: application
+        AUTH_CLIENT_ID: "${keycloak_client_id}"
+        # Privileged Keycloak client for the identity module (all three or
+        # none): the demo realm's own confidential client, as the upstream
+        # local stack does.
+        AUTH_PRIVILEGED_REALM: "${keycloak_realm}"
+        AUTH_PRIVILEGED_CLIENT_ID: "${keycloak_client_id}"
+        AUTH_SPICE_DB_BULK_CHUNK_SIZE: "1000"
+        TEMPORAL_HOST: "${temporal_frontend}"
+        TEMPORAL_NAMESPACE: default
+        TEMPORAL_ENABLE_APPROVAL: "false"
+        TEMPORAL_MAX_CONCURRENT_ACTIVITIES: "2"
+        TEMPORAL_S3_BUCKET_NAME: "${bucket_temporal}"
+        TEMPORAL_S3_ARCHIVAL_BUCKET_NAME: "${bucket_archival}"
+        TEMPORAL_S3_ENDPOINT_URL: "${s3_endpoint}"
+        TEMPORAL_S3_REGION: "${region}"
+        ARCHIVAL_ENABLED: "false"
+        ARCHIVAL_WORKFLOW_ID: WeeklyHistoryArchivalWorkflow
+        ARCHIVAL_CRON: "0 0 * * 0"
+        ARCHIVAL_BATCH_SIZE: "100"
+        ARCHIVAL_S3_PREFIX: temporal-history
+        DEFAULT_WORKFLOW_COMPLEXITY_WEIGHT: "3"
+        MAX_SYSTEM_COMPLEXITY: "20000"
+        WORKFLOW_COMPLEXITY: "{}"
+        BUCKET_NAME: "${bucket_dms}"
+        S3_ENDPOINT_URL: "${s3_endpoint}"
+        S3_EXTERNAL_URL: "${s3_endpoint}"
+        S3_REGION: "${region}"
+        CLAMAV_ENABLED: "true"
+        CLAMAV_BASE_URL: "${clamav_url}"
+        QUARANTINE_BUCKET_NAME: "${bucket_quarantine}"
+        QUARANTINE_S3_ENDPOINT_URL: "${s3_endpoint}"
+        CHECKPOINT_RETENTION_PERIOD_DAYS: "60"
+        MAX_ZIP_ENTRIES: "5000"
+        MAX_SINGLE_ENTRY_SIZE_MB: "1024"
+        MAX_ZIP_EXTRACTION_SIZE_GB: "10"
+        MAX_COMPRESSION_RATIO: "100"
+        MAX_ZIP_APPENDED_DATA_BYTES: "65536"
+        MAX_OBJECT_SIZE_MB: "1024"
+        UNO_HOST: "${unoserver_host}"
+        UNO_PORT: "2003"
+        UNO_PROTOCOL: http
+        UNO_TIMEOUT_MS: "120000"
+        UNO_PREFLIGHT_TIMEOUT_MS: "10000"
+        LAW_DATABASE_BASE_URL: "${machine_identity_proxy}/law/gesetze-normen"
+        DEFAULT_PROJECT_TYPE_ID: "00000000-0000-0000-0000-000000000000"
+        SYSTEM_USER_ID: "${system_user_id}"
+        FPP_ALLOWED_DOMAINS: ""
+        FPP_BLOCK_PRIVATE_IPS: "true"
+        EXTERNAL_SERVICE_TIMEOUT_MS: "10000"
+        PROJECT_LOGIC_SERVICE_CORS_ORIGINS: "https://${frontend_host}"
+        OTEL_EXPORTER_OTLP_ENDPOINT: "${otel_endpoint}"
+      # Secret material: one Secret with every key the pools need (envFrom).
+      secretRefs:
+        - spark-backend-secrets
+      env:
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: spark-backend-db
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: spark-backend-db
+              key: password
+        - name: DB_MIGRATE_USER
+          valueFrom:
+            secretKeyRef:
+              name: spark-backend-db
+              key: username
+        - name: DB_MIGRATE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: spark-backend-db
+              key: password
+
+  backend-services:
+    enabled: true
+    global:
+      namespaceOverride: "${app_namespace}"
+    # Demo sizing: one replica per pool (upstream: two), so 15 pools fit the
+    # node group; the KEDA/HPA knobs stay off.
+    administrative-file-draft: { replicaCount: 1 }
+    agent-orchestration-service: { replicaCount: 1 }
+    comment-service: { replicaCount: 1 }
+    document-management-service: { replicaCount: 1 }
+    examination-service: { replicaCount: 1 }
+    feedback-service: { replicaCount: 1 }
+    formal-completeness-check: { replicaCount: 1 }
+    fpp-service: { replicaCount: 1 }
+    identity-management-service: { replicaCount: 1 }
+    objections-management-service: { replicaCount: 1 }
+    plausibility-notes: { replicaCount: 1 }
+    project-logic-service: { replicaCount: 1 }
+    protocol-service: { replicaCount: 1 }
+    supplementary-requests-service: { replicaCount: 1 }
+    temporal-job-service: { replicaCount: 1 }
+
+  # -------------------------------------------------------------------------
+  frontend-services:
+    enabled: true
+    global:
+      namespaceOverride: "${app_namespace}"
+    # No published image (frontend-demo-app).
+    prototype-demo:
+      enabled: false
+    frontend:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/frontend
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      # Demo deviation (documented, README E): the image templates VITE_* into
+      # /usr/share/nginx/html at startup (sed -i) and binds port 80 — both
+      # need root; the chart's restricted defaults (uid 65532, read-only root
+      # FS) crash-loop. Unchanged between v0.2.3 and v0.3.0 (Dockerfile has
+      # no USER, nginx.conf listens on 80).
+      podSecurity:
+        restricted: false
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: false
+        capabilities:
+          drop: []
+          add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+      extraEnv:
+        - name: VITE_API_BASE_URL
+          value: "/api"
+        - name: VITE_APP_BASE_PATH
+          value: "/app"
+        - name: VITE_ENABLE_EWMS_FEATURE
+          value: "true"
+        - name: VITE_ENABLE_MAINTENANCE_MODE
+          value: "false"
+        - name: VITE_SENTRY_DSN
+          value: ""
+        - name: VITE_SENTRY_ENVIRONMENT
+          value: "demo"
+        - name: VITE_TEMPORAL_UI_BASE_URL
+          value: "https://${temporal_host}/namespaces/default/workflows"
+        # SPA-side allowlists for presigned S3 URLs: without them every
+        # upload fails client-side (observed on 0.2.x: "Hochladen
+        # fehlgeschlagen" while generate-upload-url succeeded).
+        - name: VITE_ALLOWED_UPLOAD_ORIGINS
+          value: "${s3_endpoint}"
+        - name: VITE_ALLOWED_DOWNLOAD_ORIGINS
+          value: "${s3_endpoint}"
+
+  # -------------------------------------------------------------------------
+  # Agent modules. Temporal workers die silently at cold start when the first
+  # connect to the Temporal frontend is refused (process and health server
+  # stay up, no poller) — the probes test the one observable fact: an
+  # established connection to port 7233 (0x1C41 in /proc/1/net/tcp). Same
+  # finding as 0.2.x (README E).
+  # LiteLLM serves exactly the model names below; every self-hosted/* name
+  # routes to the llm-custom queue served by agent-services.llm-client.
+  # -------------------------------------------------------------------------
+  agent-services:
+    enabled: true
+    global:
+      namespaceOverride: "${app_namespace}"
+
+    llm-client:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/llm-client
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        # ENV other than dev makes QUEUE_* mandatory (llm_client/env.py).
+        - name: ENV
+          value: production
+        - name: QUEUE_NAME
+          value: llm-custom
+        - name: QUEUE_MAX_CONCURRENT
+          value: "8"
+        - name: QUEUE_MAX_PER_SECOND
+          value: "20"
+        - name: LITELLM_BASE_URL
+          value: "${litellm_url}"
+        - name: LITELLM_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: litellm-proxy-credentials
+              key: LITELLM_MASTER_KEY
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+        - name: TEMPORAL_S3_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: temporal-s3-secrets
+              key: TEMPORAL_S3_ACCESS_KEY_ID
+        - name: TEMPORAL_S3_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: temporal-s3-secrets
+              key: TEMPORAL_S3_SECRET_ACCESS_KEY
+
+    modul-anonymisierung:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-anonymisierung
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        - name: LLM_ENABLED
+          value: "true"
+        - name: LLM_MODEL
+          value: self-hosted/gpt-oss-120b
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    modul-bewertung:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-bewertung
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        - name: DMS_BASE_URL
+          value: "${machine_identity_proxy}/api/dms/v1"
+        - name: LITELLM_BASE_URL
+          value: "${litellm_url}"
+        - name: LITELLM_MODEL
+          value: self-hosted/gpt-oss-120b
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    modul-einwendungsmanagement:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-einwendungsmanagement
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        - name: DMS_BASE_URL
+          value: "${machine_identity_proxy}/api/dms/v1"
+        - name: LITELLM_MODEL_NAME
+          value: self-hosted/gpt-oss-120b
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_LLM_MAX_PER_SECOND
+          value: "10"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    modul-formale-pruefung:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-formale-pruefung
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        # Leaf default points straight at the pool; strict mode needs the
+        # machine-identity proxy in between (see global TEMPORAL_JOB_SERVICE_URL).
+        - name: DMS_BASE_URL
+          value: "${machine_identity_proxy}/api/dms/v1"
+        - name: LITELLM_BASE_URL
+          value: "${litellm_url}"
+        - name: LITELLM_MODEL
+          value: self-hosted/gpt-oss-120b
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_LLM_MAX_PER_SECOND
+          value: "10"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    modul-inhaltsextraktion-sachverhalt:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-inhaltsextraktion
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        # The published image sets TRANSFORMERS_OFFLINE=1 without the
+        # pre-baked model cache (0.2.x finding, README E) — online mode lets
+        # the anonymous Hugging Face download happen at startup.
+        - name: TRANSFORMERS_OFFLINE
+          value: "0"
+        - name: HF_HUB_OFFLINE
+          value: "0"
+        - name: HF_HOME
+          value: /tmp/hf
+        - name: METADATA_MODEL_NAME
+          value: self-hosted/gpt-oss-120b
+        - name: SCHWERPUNKTTHEMA_MODEL_NAME
+          value: self-hosted/gpt-oss-120b
+        - name: STRUCTURE_MODEL_NAME
+          value: self-hosted/gpt-oss-120b
+        - name: SUMMARIZATION_MODEL_NAME
+          value: self-hosted/gpt-oss-120b
+        - name: EMBEDDING_MODEL
+          value: self-hosted/bge-m3
+        - name: INJECTION_LLM_MODEL
+          value: self-hosted/gpt-oss-120b
+        # The VLM stages send image content blocks; gpt-oss-120b is text-only
+        # (Bedrock 400 on every element) — served as a vision model.
+        - name: VLLM_MODEL
+          value: "${vlm_model_name}"
+        - name: VLM_SUMMARY_MODEL_NAME
+          value: "${vlm_model_name}"
+        - name: LITELLM_BASE_URL
+          value: "${litellm_url}"
+        - name: INJECTION_MODEL_URL
+          value: "http://localhost:9999/predict"
+        # Required by the module's settings but set by no 0.3.0 values file
+        # (observed from zero: "DMS_BASE_URL Field required", CrashLoop).
+        # The Python DmsClient appends /v2/files and /v2/internal/files/...,
+        # which the modulith serves under its /api/dms/v1 group.
+        - name: DMS_BASE_URL
+          value: "${machine_identity_proxy}/api/dms/v1"
+        - name: KEYCLOAK_TOKEN_URL
+          value: https://${keycloak_host}/realms/${keycloak_realm}/protocol/openid-connect/token
+        - name: DOCLING_HOST
+          value: "${docling_host}"
+        # Service port 80 (targetPort 5001); 5001 on the ClusterIP times out.
+        - name: DOCLING_PORT
+          value: "80"
+        - name: DOCLING_PROTOCOL
+          value: http
+        - name: QDRANT_BASE_URL
+          value: "http://${qdrant_host}:6333"
+        - name: UNO_HOST
+          value: "${unoserver_host}"
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_SERVER_URL
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    modul-plausibilitaet-pruefung:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-plausibilitaet-pruefung
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      replicaCount: 2
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        - name: DMS_BASE_URL
+          value: "${machine_identity_proxy}/api/dms/v1"
+        - name: LITELLM_MODEL
+          value: self-hosted/gpt-oss-120b
+        - name: LITELLM_EMBEDDING_MODEL
+          value: self-hosted/bge-m3
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: QDRANT_CLUSTER_ENDPOINT
+          value: "http://${qdrant_host}:6333"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    modul-rechtsmethodik:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-rechtsmethodik
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        - name: LEGAL_DEFINITION_POSTGRES_DATABASE
+          value: rechtsbegriffe
+        - name: LEGAL_DEFINITION_POSTGRES_HOST
+          value: "${rds_host}"
+        - name: LEGAL_DEFINITION_POSTGRES_PORT
+          value: "${rds_port}"
+        - name: LEGAL_DEFINITION_POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-cluster-user
+              key: username
+        - name: LEGAL_DEFINITION_POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-cluster-user
+              key: password
+        # The 0.3.0 chart no longer sets the module's LAW_DATABASE_* URLs
+        # (nested settings, required; observed from zero: "LAW_DATABASE Field
+        # required", CrashLoop). Paths as the 0.2.3 chart had them, but through
+        # the machine-identity proxy (platform chart): the three legal-data
+        # services run AUTH_MODE=strict and the module calls them without a
+        # credential (observed: every MVPWorkflow failed, LoadNormWorkflow 401
+        # on /documents/<jurabk>; the material completeness check showed
+        # "0 von 33 Normen geprüft" and no findings).
+        - name: LAW_DATABASE_DOCUMENTS_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen/documents/"
+        - name: LAW_DATABASE_NORMS_SEARCH_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen/norms/search"
+        - name: LAW_DATABASE_ABSATZ_JURABK_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen/absatz/{jurabk}"
+        - name: LAW_DATABASE_DOCUMENTS_SEARCH_TERM_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen/documents/search/{search_term}"
+        - name: LAW_DATABASE_DOCUMENTS_JURABK_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen/documents/{jurabk}"
+        - name: LAW_DATABASE_LEGALDEFINITIONEN_JURABK_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen/legaldefinitionen/{jurabk}"
+        - name: LAW_DATABASE_TECHNISCHE_NORMEN_DOKUMENT_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen/technische-normen/{dokument}"
+        - name: LAW_DATABASE_QUERY_TOP_K_DR_URL
+          value: "${machine_identity_proxy}/law/gesetzesbegruendung/query_top_k"
+        - name: LAW_DATABASE_QUERY_K_RESULTS_UT_URL
+          value: "${machine_identity_proxy}/law/jura/query_k_results"
+        - name: LAW_DATABASE_QUERY_CHUNKS_UT_URL
+          value: "${machine_identity_proxy}/law/jura/chunks"
+        - name: MODELS_LARGE_LLM
+          value: self-hosted/gpt-oss-120b
+        - name: MODELS_MEDIUM_LLM
+          value: self-hosted/gpt-oss-120b
+        - name: MODELS_SMALL_LLM
+          value: self-hosted/gpt-oss-120b
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    modul-suche-und-zuordnung:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/modul-suche-und-zuordnung
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      startupProbe: *temporalWorkerStartupProbe
+      livenessProbe: *temporalWorkerLivenessProbe
+      extraEnv:
+        # The chart's leaf defaults point straight at the formal-completeness
+        # pool and at two legal-data services; the module appends
+        # /<projectId> to FCS_BASE_URL while the pool serves the check under
+        # /api/fcs/v1 (observed: "Rule-based API returned HTTP 404", every
+        # suche_zuordnung_norm workflow failed, no findings in the material
+        # completeness check), and all three run AUTH_MODE=strict while the
+        # module sends no credential. Through the machine-identity proxy.
+        - name: FCS_BASE_URL
+          value: "${machine_identity_proxy}/api/fcs/v1"
+        - name: LAW_DATABASE_DKE_BASE_URL
+          value: "${machine_identity_proxy}/law/gesetzesbegruendung/"
+        - name: LAW_DATABASE_UT_BASE_URL
+          value: "${machine_identity_proxy}/law/jura/"
+        - name: LLM_DB_RESEARCH_MODEL
+          value: self-hosted/gpt-oss-120b
+        - name: LLM_EMBEDDING_MODEL
+          value: self-hosted/bge-m3
+        - name: LLM_PAGEINDEX_SVM_MODEL_STAGE1
+          value: self-hosted/gpt-oss-120b
+        - name: LLM_PAGEINDEX_SVM_MODEL_STAGE2
+          value: self-hosted/gpt-oss-120b
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: QDRANT_HOST
+          value: "${qdrant_host}"
+        - name: QDRANT_PORT
+          value: "6333"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    gesetze-normen-db-service:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/gesetze-normen-db-service
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      extraEnv:
+        - name: DB_HOST
+          value: "${rds_host}"
+        - name: DB_PORT
+          value: "${rds_port}"
+        - name: DB_NAME
+          value: gesetze_normen
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: gesetze-normen-db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: gesetze-normen-db-credentials
+              key: password
+        - name: DB_MAXOVERFLOW
+          value: "10"
+        - name: DB_POOLSIZE
+          value: "15"
+        - name: LOG_LEVEL
+          value: INFO
+        - name: GCP_TEAM2PDFURL
+          value: ""
+        - name: GCP_GCPPROJECT
+          value: ""
+        - name: GCP_BUCKETTEAM2NAME
+          value: ""
+        - name: GCP_BUCKETTEAM7NAME
+          value: ""
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    gesetzesbegruendung-db-service:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/gesetzesbegruendung-db-service
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      extraEnv:
+        - name: DB_HOST
+          value: "${rds_host}"
+        - name: DB_PORT
+          value: "${rds_port}"
+        - name: DB_NAME
+          value: gesetzesbegruendung
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: gesetzesbegruendung-db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: gesetzesbegruendung-db-credentials
+              key: password
+        - name: CHUNKING_URL
+          value: "${litellm_url}"
+        # The chunking client embeds at startup (aembed_query) — an embedding
+        # model, not the chat model (observed from zero: LiteLLM 500 "Unable to
+        # determine bedrock embedding provider for openai.gpt-oss-120b", pod in
+        # CrashLoop). Same value the 0.2.3 charts carried.
+        - name: CHUNKING_MODEL
+          value: self-hosted/bge-m3
+        - name: CHUNKING_OVERLAP
+          value: "256"
+        - name: CHUNKING_PROVIDER
+          value: litellm
+        - name: CHUNKING_SIZE
+          value: "2048"
+        # Embedding timeout (db-services-shared LLMConfig default 5 s): the
+        # CPU bge-m3 (TEI) answers in 60 ms idle but queues under the
+        # parallel research of the material completeness check (measured
+        # 2026-10-20: 382 of 622 requests over 2 s, max 84 s; 31 of 109
+        # query_top_k calls -> 500 APITimeoutError).
+        - name: CHUNKING_TIMEOUT
+          value: "120"
+        - name: CHUNKING_APIKEY
+          valueFrom:
+            secretKeyRef:
+              name: litellm-proxy-credentials
+              key: master-key
+        - name: DB_MAXOVERFLOW
+          value: "5"
+        - name: DB_POOLSIZE
+          value: "10"
+        - name: DOCLING_HOST
+          value: "${docling_host}"
+        - name: DOCLING_OCR_ENGINE
+          value: easyocr
+        - name: DOCLING_PORT
+          value: "80"
+        - name: DOCLING_PROTOCOL
+          value: http
+        - name: ENABLE_METRICS
+          value: "true"
+        - name: GESETZE_NORMEN_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen"
+        - name: KEYCLOAK_TOKEN_URL
+          value: https://${keycloak_host}/realms/${keycloak_realm}/protocol/openid-connect/token
+        - name: KEYCLOAK_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: docling-keycloak-secrets
+              key: KEYCLOAK_CLIENT_ID
+        - name: KEYCLOAK_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: docling-keycloak-secrets
+              key: KEYCLOAK_CLIENT_SECRET
+        - name: LOG_LEVEL
+          value: INFO
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    jura-db-service:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/jura-db-service
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      extraEnv:
+        - name: DB_HOST
+          value: "${rds_host}"
+        - name: DB_PORT
+          value: "${rds_port}"
+        - name: DB_NAME
+          value: jura
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: jura-db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: jura-db-credentials
+              key: password
+        - name: CHUNKING_URL
+          value: "${litellm_url}"
+        # The chunking client embeds at startup (aembed_query) — an embedding
+        # model, not the chat model (observed from zero: LiteLLM 500 "Unable to
+        # determine bedrock embedding provider for openai.gpt-oss-120b", pod in
+        # CrashLoop). Same value the 0.2.3 charts carried.
+        - name: CHUNKING_MODEL
+          value: self-hosted/bge-m3
+        - name: CHUNKING_OVERLAP
+          value: "256"
+        - name: CHUNKING_PROVIDER
+          value: litellm
+        - name: CHUNKING_SIZE
+          value: "2048"
+        # Embedding timeout (db-services-shared LLMConfig default 5 s): the
+        # CPU bge-m3 (TEI) answers in 60 ms idle but queues under the
+        # parallel research of the material completeness check (measured
+        # 2026-10-20: 382 of 622 requests over 2 s, max 84 s; 31 of 109
+        # query_top_k calls -> 500 APITimeoutError).
+        - name: CHUNKING_TIMEOUT
+          value: "120"
+        - name: CHUNKING_APIKEY
+          valueFrom:
+            secretKeyRef:
+              name: litellm-proxy-credentials
+              key: master-key
+        - name: DB_MAXOVERFLOW
+          value: "5"
+        - name: DB_POOLSIZE
+          value: "15"
+        - name: ENABLE_METRICS
+          value: "true"
+        - name: GESETZE_NORMEN_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen"
+        - name: LOG_LEVEL
+          value: INFO
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"
+
+    rechtsaenderungs-monitoring:
+      image:
+        repository: registry.opencode.de/bmds/planungs-und-genehmigungsbeschleunigung/spark-workflow/rechtsaenderungs-monitoring
+        tag: "v0.3.0"
+        pullPolicy: IfNotPresent
+      extraEnv:
+        # Chart leaf points straight at the gesetze-normen service (strict
+        # mode, no credential in this service): through the proxy.
+        - name: GESETZE_NORMEN_URL
+          value: "${machine_identity_proxy}/law/gesetze-normen"
+        - name: DB_HOST
+          value: "${rds_host}"
+        - name: DB_PORT
+          value: "${rds_port}"
+        - name: DB_NAME
+          value: rechtsaenderungs_monitoring
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: rechtsaenderungs-monitoring-db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rechtsaenderungs-monitoring-db-credentials
+              key: password
+        - name: LLM_CATEGORISATION_URL
+          value: "${litellm_url}"
+        - name: LLM_SUMMARISATION_URL
+          value: "${litellm_url}"
+        - name: OTEL_ENDPOINT
+          value: "${otel_endpoint}"
+        - name: TEMPORAL_HOST
+          value: "${temporal_frontend}"
+        - name: TEMPORAL_S3_BUCKET_NAME
+          value: "${bucket_temporal}"
+        - name: TEMPORAL_S3_ENDPOINT_URL
+          value: "${s3_endpoint}"
+        - name: TEMPORAL_S3_REGION
+          value: "${region}"

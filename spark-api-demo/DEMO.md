@@ -9,6 +9,32 @@ Companion docs: [README](README.md) (architecture + deviations),
 
 ---
 
+## What to demo — and the two documented gaps
+
+**Demonstrate the AI here (real Amazon Bedrock calls, live):** open the demo
+inspector first (the **"API"** button, bottom right) and watch the **Backend**
+tab — the LLM calls appear within seconds of starting a check.
+
+- **Formelle Prüfung → Vollständigkeitsprüfung → "Prüfung starten"**: matches
+  2 of 3 required documents and flags the missing Schallschutzgutachten.
+- **Formelle Prüfung → Kohärenzprüfung → "Prüfung starten"** (enabled after the
+  Vollständigkeitsprüfung): finds the planted contradiction (building height
+  12 m vs 15 m).
+
+**Do NOT present these as working — documented gaps (the proprietary Pharia
+Document Index is not part of the open-source demo):**
+
+- **Dokumentensuche / Document Search**: returns "Dokument nicht gefunden" —
+  there is no document search index in the open demo.
+- **Materielle / Substantive Prüfung**: the legal-norm corpus is empty, so the
+  norm matching fails ("Process failed"). The Formelle Prüfung above is the
+  substantive AI the open product ships.
+
+The `AI-supported` / `KI-unterstützt` badges are fixed labels on AI-assisted
+features, not a run status — they stay after a reset.
+
+---
+
 ## 0. Set Up Access (once per working day)
 
 ```bash
@@ -159,6 +185,14 @@ REST calls and the LLM calls via LiteLLM → Bedrock.
 
 - Sidebar "Materielle Pruefung": one seeded application card per
   Verfahren renders with approval status.
+- Only the top entry and "Rechtsnormen hinzufuegen" (Add Legal Norms)
+  open the MFE. The "Rechtsnormen" group and its children "Rechtsnormen",
+  "Einzelpruefungen", "Zusammenfassung" are label-only shell routes with
+  no component behind them in the upstream shell (`processConfig.ts`,
+  unchanged since v0.4.1) — the content area shows the shell's own
+  "404 - Seite nicht gefunden". Same for "Stellungsnahmen"/"Abschnitte"
+  under Einwendungsmanagement. Not a deployment defect; steer the demo
+  through the top entries.
 - Opening a card shows the "no matching jobs" notification (upstream
   semantics: 404 = nothing ran yet). Starting a match runs through
   Antragstyp identification and chunk retrieval, then fails cleanly at

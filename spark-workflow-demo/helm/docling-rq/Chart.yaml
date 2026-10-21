@@ -1,0 +1,19 @@
+# Vendored from spark-workflow v0.2.3 (helm/charts/sources/external/docling-rq,
+# EUPL-1.2, see THIRD_PARTY_NOTICES.md). Upstream 0.3.0 dropped the chart and
+# treats Docling as an external endpoint (<docling-host>); the demo keeps
+# running it in-cluster. Changes against the original: no redis subchart
+# dependency (ElastiCache Valkey via redisUrl.secretName), CPU worker defaults.
+apiVersion: v2
+name: docling-rq
+description: >
+  Helm chart for the Docling-Serve RQ service — document parsing and layout
+  analysis backed by a Redis Queue (RQ) worker pool. Bundles the API server,
+  configurable CPU/GPU worker Deployments, a PodDisruptionBudget, and an
+  Redis URL taken from a Secret (ElastiCache Valkey in the demo).
+
+  This chart does not render CRD-specific resources (ExternalSecrets, Istio
+  VirtualServices / AuthorizationPolicies). Those are managed outside Helm.
+type: application
+version: 0.1.0
+appVersion: "v1.14.3"
+

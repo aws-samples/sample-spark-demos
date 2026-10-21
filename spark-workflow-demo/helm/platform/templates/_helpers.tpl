@@ -35,3 +35,4 @@ clientSecret:
 logoutPath: /oauth2/sign_out
 forwardAccessToken: true
 {{- end }}
+

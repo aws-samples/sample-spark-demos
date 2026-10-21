@@ -34,8 +34,8 @@ output "s3_buckets" {
 }
 
 output "valkey_endpoint" {
-  description = "Valkey primary endpoint (null when disabled)."
-  value       = var.valkey_enabled ? module.valkey[0].primary_endpoint : null
+  description = "Valkey primary endpoint (docling-rq broker)."
+  value       = module.valkey.primary_endpoint
 }
 
 output "secret_names" {

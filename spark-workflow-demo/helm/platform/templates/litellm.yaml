@@ -27,6 +27,13 @@ data:
         litellm_params:
           model: bedrock/{{ .Values.litellm.bedrockVlmModelId }}
           aws_region_name: {{ .Values.litellm.bedrockRegion }}
+      {{- range .Values.litellm.vlmAliases }}
+      # Same vision model under a name the upstream code hard-codes.
+      - model_name: {{ . }}
+        litellm_params:
+          model: bedrock/{{ $.Values.litellm.bedrockVlmModelId }}
+          aws_region_name: {{ $.Values.litellm.bedrockRegion }}
+      {{- end }}
       {{- if .Values.tei.enabled }}
       - model_name: {{ .Values.litellm.embeddingModelName }}
         litellm_params:

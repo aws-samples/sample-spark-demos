@@ -1,0 +1,73 @@
+{{- if .Values.machineIdentityProxy.enabled }}
+# Service-to-service calls of the agent modules into the spark-backend pools
+# (DMS file metadata/downloads, workflow status posts). Upstream 0.3.0 runs
+# the backend in STRICT auth mode and identifies a calling service by the
+# SPIFFE id in the x-forwarded-client-cert header that an Istio sidecar sets
+# from the caller's mTLS certificate (AUTH_ALLOWED_MACHINE_IDENTITIES). The
+# Python modules carry no credential of their own (observed from zero: every
+# dms_get_file_metadata activity failed 401, the extraction workflow with
+# it). The demo runs no mesh, so this proxy stamps the header the pools
+# expect for exactly the module-to-backend hops; the modules get its address
+# as DMS_BASE_URL / TEMPORAL_JOB_SERVICE_URL. Trust boundary: the cluster
+# network — without a mesh the pools already accept that header from any pod
+# in the cluster, so nothing is widened; a production setup replaces this with
+# the mesh (THREAT-MODEL R-1).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: machine-identity-proxy
+  namespace: {{ .Values.appNamespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {{- include "spark-platform.selectorLabels" "machine-identity-proxy" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "spark-platform.selectorLabels" "machine-identity-proxy" | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/machine-identity-proxy-config.yaml") . | sha256sum | trunc 16 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: nginx
+          image: {{ .Values.machineIdentityProxy.image }}
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/nginx/conf.d/default.conf, subPath: default.conf, readOnly: true }
+            - { name: cache, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: machine-identity-proxy }
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: machine-identity-proxy
+  namespace: {{ .Values.appNamespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "spark-platform.selectorLabels" "machine-identity-proxy" | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http }
+{{- end }}

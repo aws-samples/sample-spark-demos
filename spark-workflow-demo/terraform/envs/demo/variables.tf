@@ -117,18 +117,6 @@ variable "external_oidc_client_secret" {
 }
 
 # --- Feature flags ------------------------------------------------------------------
-variable "valkey_enabled" {
-  description = "Use Amazon ElastiCache for Valkey as the docling-rq broker (false = embedded Redis container)."
-  type        = bool
-  default     = true
-}
-
-variable "seed_jobs_enabled" {
-  description = "Run the upstream lookup-data seeds (project types, statuses, ...) after each umbrella change."
-  type        = bool
-  default     = true
-}
-
 variable "gpu_enabled" {
   description = "Provision a GPU node group for Docling CUDA mode."
   type        = bool

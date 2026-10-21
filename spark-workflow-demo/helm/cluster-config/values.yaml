@@ -7,9 +7,6 @@ acmeEmail: ""
 # Namespace holding the Gateway, EnvoyProxy and TLS certificate.
 platformNamespace: spark-platform
 
-# Application namespace (supplementary spicedb-operator Role).
-appNamespace: spark
-
 # CIDRs allowed to reach the public NLB. Empty = open to the internet.
 allowedCidrs: []
 

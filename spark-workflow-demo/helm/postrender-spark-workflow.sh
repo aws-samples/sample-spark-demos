@@ -1,30 +1,13 @@
 #!/usr/bin/env bash
-# Helm postrenderer for the upstream umbrella (documented workarounds,
-# upstream stays unmodified; issues are reported upstream):
+# Helm postrenderer for the upstream spark-platform umbrella.
 #
-# 1. spicedb-operator v1.23.0 does not know the chart argument `--crd=/crds`
-#    (prints usage and crashes); the boolean `--crd` in turn requires CRD
-#    write permissions the chart's minimal ClusterRole does not grant.
-#    The SpiceDBCluster CRD is already installed by the cluster-config
-#    chart — the argument is dropped without replacement.
-#
-# 2. docling-rq worker: the GKE GPU nodeSelector and nvidia.com/gpu
-#    resources from the chart defaults cannot be removed via values (Helm
-#    merges maps and drops null overrides across two subchart levels,
-#    helm#12511). In CPU mode (argument "cpu") both are stripped;
-#    in GPU mode the nvidia resources are kept.
-#
-# Usage: postrender-spark-workflow.sh [cpu|gpu]   (default: cpu)
+# 0.2.x needed two patches here (spicedb-operator `--crd=/crds`, docling-rq GKE
+# GPU nodeSelector/resources). Neither manifest exists in the 0.3.0 chart tree:
+# SpiceDB is a plain Deployment in our platform chart, Docling is our own
+# docling-rq release with values that set no GPU defaults. Measured with
+# `git grep -e '--crd' -e gke-accelerator -e nvidia.com/gpu v0.3.0 -- helm`:
+# no hit in a manifest. The hook stays wired (helm provider `postrender`) as
+# the documented place for the next upstream workaround; today it passes the
+# render through unchanged.
 set -euo pipefail
-MODE="${1:-cpu}"
-
-if [ "$MODE" = "gpu" ]; then
-  sed \
-    -e '/^ *- --crd\(=\/crds\)\{0,1\}$/d' \
-    -e '/^ *cloud\.google\.com\/gke-accelerator:/d'
-else
-  sed \
-    -e '/^ *- --crd\(=\/crds\)\{0,1\}$/d' \
-    -e '/^ *cloud\.google\.com\/gke-accelerator:/d' \
-    -e '/^ *nvidia\.com\/gpu:/d'
-fi
+cat

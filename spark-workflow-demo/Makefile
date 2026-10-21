@@ -45,14 +45,8 @@ export TF_VAR_demo_user_email := $(SPARK_WORKFLOW_DEMO_USER_EMAIL)
 ifdef SPARK_WORKFLOW_GPU_ENABLED
 export TF_VAR_gpu_enabled := $(SPARK_WORKFLOW_GPU_ENABLED)
 endif
-ifdef SPARK_WORKFLOW_VALKEY_ENABLED
-export TF_VAR_valkey_enabled := $(SPARK_WORKFLOW_VALKEY_ENABLED)
-endif
 ifdef BEDROCK_VLM_MODEL_ID
 export TF_VAR_bedrock_vlm_model_id := $(BEDROCK_VLM_MODEL_ID)
-endif
-ifdef SPARK_WORKFLOW_SEED_JOBS_ENABLED
-export TF_VAR_seed_jobs_enabled := $(SPARK_WORKFLOW_SEED_JOBS_ENABLED)
 endif
 ifdef SPARK_WORKFLOW_NODE_INSTANCE_TYPE
 export TF_VAR_node_instance_type := $(SPARK_WORKFLOW_NODE_INSTANCE_TYPE)
@@ -97,13 +91,13 @@ stage-charts:
 init: check-env
 	terraform -chdir=$(TF_DIR) init
 
-plan: check-env stage-charts
+plan: check-env init stage-charts
 	terraform -chdir=$(TF_DIR) plan
 
-apply: check-env stage-charts
+apply: check-env init stage-charts
 	terraform -chdir=$(TF_DIR) apply
 
-destroy: check-env
+destroy: check-env init
 	terraform -chdir=$(TF_DIR) destroy
 
 fmt:

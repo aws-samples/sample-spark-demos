@@ -39,10 +39,11 @@ resource "helm_release" "platform" {
       oauth2Proxy = var.secret_names["oauth2_proxy"]
       spicedb     = var.secret_names["spicedb"]
       litellm     = var.secret_names["litellm"]
-      valkey      = var.valkey_enabled ? var.secret_names["valkey"] : ""
+      valkey      = var.secret_names["valkey"]
     }, contains(keys(var.secret_names), "external_oidc") ? { externalOidc = var.secret_names["external_oidc"] } : {})
 
     keycloak = {
+      demoUser = { id = var.demo_user_id }
       externalOidc = {
         enabled   = var.external_oidc_issuer_url != ""
         issuerUrl = var.external_oidc_issuer_url
@@ -74,28 +75,22 @@ resource "helm_release" "platform" {
       bedrockVlmModelId = var.bedrock_vlm_model_id
     }
 
-    # Secrets the upstream umbrella references in the app namespace
-    # (extracted from a full `helm template` render of 00-spark-workflow).
+    # Secrets the upstream 0.3.0 umbrella references in the app namespace
+    # (names from a full `helm template` of spark-platform with our overlay;
+    # the render check lists them: .kiro/tools/render-workflow.sh).
     appSecrets = concat(
-      # Per-service DB user secrets → all map to the shared spark_app role.
+      # The agent data services keep one credentials Secret each (upstream
+      # names); every one of them maps to the shared spark_app role.
       [for name in [
-        "project-logic-db-user",
-        "dms-db-user",
-        "formal-check-db-user",
-        "examination-db-user",
-        "comment-service-db-user",
-        "plausibility-notes-db-user",
-        "objections-service-db-user",
-        "supplementary-requests-db-user",
-        "admin-file-draft-db-user",
-        "temporal-job-service-db-user",
-        "identity-management-db-user",
-        "gesetze-normen-db-user",
-        "fpp-db-user",
-        "feedback-service-db-user",
+        "gesetze-normen-db-credentials",
+        "gesetzesbegruendung-db-credentials",
         "jura-db-credentials",
-        "begruendungen-db-credentials",
-        "rechtsaenderungsmonitoring-credentials",
+        "rechtsaenderungs-monitoring-db-credentials",
+        # modul-rechtsmethodik's legal-terms store (rechtsbegriffe database).
+        "postgres-cluster-user",
+        # The 15 backend pools: runtime and migration role (DB_USER /
+        # DB_MIGRATE_USER) are the same role in the demo.
+        "spark-backend-db",
         ] : {
         name = name
         data = [
@@ -104,6 +99,29 @@ resource "helm_release" "platform" {
         ]
       }],
       [
+        # Everything the backend pools need that is not configuration, loaded
+        # with envFrom (global.backend.secretRefs). FPP_* (optional, all five
+        # or none) and ARCHIVAL_ENCRYPTION_KEY (archival off) are left out on
+        # purpose.
+        {
+          name = "spark-backend-secrets"
+          data = [
+            { secretKey = "AUTH_CLIENT_SECRET", remoteRef = { key = var.secret_names["keycloak"], property = "client_secret" } },
+            { secretKey = "AUTH_PRIVILEGED_CLIENT_SECRET", remoteRef = { key = var.secret_names["keycloak"], property = "client_secret" } },
+            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
+            { secretKey = "S3_ACCESS_KEY_ID", remoteRef = { key = var.secret_names["s3_app"], property = "access_key_id" } },
+            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
+            { secretKey = "S3_SECRET_ACCESS_KEY", remoteRef = { key = var.secret_names["s3_app"], property = "secret_access_key" } },
+            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
+            { secretKey = "TEMPORAL_S3_ACCESS_KEY_ID", remoteRef = { key = var.secret_names["s3_app"], property = "access_key_id" } },
+            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
+            { secretKey = "TEMPORAL_S3_SECRET_ACCESS_KEY", remoteRef = { key = var.secret_names["s3_app"], property = "secret_access_key" } },
+            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
+            { secretKey = "QUARANTINE_S3_ACCESS_KEY_ID", remoteRef = { key = var.secret_names["s3_app"], property = "access_key_id" } },
+            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
+            { secretKey = "QUARANTINE_S3_SECRET_ACCESS_KEY", remoteRef = { key = var.secret_names["s3_app"], property = "secret_access_key" } },
+          ]
+        },
         # Temporal server persistence password (official chart existingSecret).
         {
           name = "temporal-db-credentials"
@@ -111,8 +129,7 @@ resource "helm_release" "platform" {
             { secretKey = "password", remoteRef = { key = var.secret_names["rds_temporal"], property = "password" } },
           ]
         },
-        # Temporal payload offloading S3 credentials (both names the source
-        # charts reference — the umbrella overrides only some entries).
+        # Temporal payload offloading S3 credentials (agent modules, llm-client).
         {
           name = "temporal-s3-secrets"
           data = [
@@ -122,53 +139,12 @@ resource "helm_release" "platform" {
             { secretKey = "TEMPORAL_S3_SECRET_ACCESS_KEY", remoteRef = { key = var.secret_names["s3_app"], property = "secret_access_key" } },
           ]
         },
-        {
-          name = "agent-orchestration-temporal-s3-secrets"
-          data = [
-            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
-            { secretKey = "TEMPORAL_S3_ACCESS_KEY_ID", remoteRef = { key = var.secret_names["s3_app"], property = "access_key_id" } },
-            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
-            { secretKey = "TEMPORAL_S3_SECRET_ACCESS_KEY", remoteRef = { key = var.secret_names["s3_app"], property = "secret_access_key" } },
-          ]
-        },
-        # Per-service LiteLLM API-key secrets (jura/gesetzesbegruendung chunking).
-        {
-          name = "jura-litellm"
-          data = [
-            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
-            { secretKey = "master-key", remoteRef = { key = var.secret_names["litellm"], property = "master_key" } },
-          ]
-        },
-        {
-          name = "begruendung-litellm"
-          data = [
-            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
-            { secretKey = "master-key", remoteRef = { key = var.secret_names["litellm"], property = "master_key" } },
-          ]
-        },
         # Prompt-injection guard: the module downloads a public HF model —
         # the token must be EMPTY (anonymous); any filler breaks with 401.
         {
           name = "injection-model-secret"
           data = [
             { secretKey = "INJECTION_MODEL_TOKEN", remoteRef = { key = var.secret_names["litellm"], property = "injection_model_token" } },
-          ]
-        },
-        # Document management S3 credentials (app + quarantine).
-        {
-          name = "dms-secrets"
-          data = [
-            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
-            { secretKey = "S3_ACCESS_KEY_ID", remoteRef = { key = var.secret_names["s3_app"], property = "access_key_id" } },
-            # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
-            { secretKey = "S3_SECRET_ACCESS_KEY", remoteRef = { key = var.secret_names["s3_app"], property = "secret_access_key" } },
-          ]
-        },
-        {
-          name = "dms-quarantine-bucket-credentials"
-          data = [
-            { secretKey = "access-key", remoteRef = { key = var.secret_names["s3_app"], property = "access_key_id" } },
-            { secretKey = "secret-key", remoteRef = { key = var.secret_names["s3_app"], property = "secret_access_key" } },
           ]
         },
         # LiteLLM master key — both key spellings used across charts.
@@ -180,14 +156,6 @@ resource "helm_release" "platform" {
             { secretKey = "master-key", remoteRef = { key = var.secret_names["litellm"], property = "master_key" } },
           ]
         },
-        # OIDC client credentials for services talking to Keycloak.
-        {
-          name = "keycloak-client"
-          data = [
-            { secretKey = "client_id", remoteRef = { key = var.secret_names["keycloak"], property = "client_id" } },
-            { secretKey = "client_secret", remoteRef = { key = var.secret_names["keycloak"], property = "client_secret" } },
-          ]
-        },
         # Docling OAuth client (points at the demo realm; in-cluster Docling
         # does not enforce it, kept for upstream contract compatibility).
         {
@@ -196,17 +164,6 @@ resource "helm_release" "platform" {
             { secretKey = "KEYCLOAK_CLIENT_ID", remoteRef = { key = var.secret_names["keycloak"], property = "client_id" } },
             # checkov:skip=CKV_SECRET_6: Kubernetes secret KEY name + Secrets Manager reference, not a value
             { secretKey = "KEYCLOAK_CLIENT_SECRET", remoteRef = { key = var.secret_names["keycloak"], property = "client_secret" } },
-          ]
-        },
-        # FPP portal integration placeholders (integration out of demo scope).
-        {
-          name = "fpp-secrets"
-          data = [
-            { secretKey = "oidc_client_id", remoteRef = { key = var.secret_names["fpp"], property = "oidc_client_id" } },
-            { secretKey = "oidc_client_secret", remoteRef = { key = var.secret_names["fpp"], property = "oidc_client_secret" } },
-            { secretKey = "oidc_user", remoteRef = { key = var.secret_names["fpp"], property = "oidc_user" } },
-            { secretKey = "oidc_password", remoteRef = { key = var.secret_names["fpp"], property = "oidc_password" } },
-            { secretKey = "oidc_token_url", remoteRef = { key = var.secret_names["fpp"], property = "oidc_token_url" } },
           ]
         },
       ]

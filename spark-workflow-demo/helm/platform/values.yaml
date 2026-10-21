@@ -15,28 +15,49 @@ frontendServicePort: 80
 oidcPolicy:
   enabled: true
 
-# API path routing on the frontend host, derived from the upstream frontend
-# contract (src/integrations/api-clients/configureClients.ts + vite proxy).
-# prefix   = client base path appended to VITE_API_BASE_URL (/api)
-# rewrite  = path prefix the backend expects ("/" strips everything)
-# service  = chart name in the app umbrella ({appReleaseName}-<service>)
-# port     = Service port (all upstream service charts expose 80)
-apiRoutes:
-  - { prefix: /pls/v1, service: project-logic-service }
-  - { prefix: /dms/v1, service: document-management-service }
-  - { prefix: /fcs/v1, service: formal-completeness-check }
-  - { prefix: /agent-orchestration/v1, service: agent-orchestration-service }
-  - { prefix: /temporal, service: temporal-job-service, rewrite: /temporal }
-  - { prefix: /plausibility-notes/v1, service: plausibility-notes }
-  - { prefix: /oms/v1, service: objections-management-service }
-  - { prefix: /supplementary-requests/v1, service: supplementary-requests-service }
-  - { prefix: /comment/v1, service: comment-service }
-  - { prefix: /examination/v1, service: examination-service }
-  - { prefix: /vae/v1, service: administrative-file-draft }
-  - { prefix: /law-changes/v1, service: rechtsaenderungs-monitoring }
-  - { prefix: /identity, service: identity-management-service }
-  - { prefix: /feedback/v1, service: feedback-service }
-  - { prefix: /protocol/v1, service: protocol-service }
+# API path routing on the frontend host — the upstream 0.3.0 contract (the
+# gateway-routes chart's dashboard-api routes, which the demo does not
+# install; see design.md). The SPA calls ${VITE_API_BASE_URL}<prefix>/...;
+# the spark-backend pool receives the path unchanged (every pool serves the
+# whole /api surface, the pool only separates the load). Kubernetes allows 16
+# rules per HTTPRoute, hence two lists.
+# prefix   = path after /api
+# service  = chart alias in the app umbrella ({appReleaseName}-<service>)
+# rewrite  = optional ReplacePrefixMatch (only the law-changes service wants /)
+# timeout  = optional request/backend timeout (document uploads, workflows)
+apiRoutesV1:
+  - { prefix: /identity/, service: identity-management-service }
+  - { prefix: /pls/v1/, service: project-logic-service }
+  - { prefix: /dms/v1/, service: document-management-service, timeout: 120s }
+  - { prefix: /fcs/v1/, service: formal-completeness-check }
+  - { prefix: /agent-orchestration/v1/, service: agent-orchestration-service }
+  - { prefix: /oms/v1/, service: objections-management-service }
+  - { prefix: /examination/v1/, service: examination-service }
+  - { prefix: /vae/v1/, service: administrative-file-draft }
+  - { prefix: /supplementary-requests/v1/, service: supplementary-requests-service }
+  - { prefix: /plausibility-notes/v1/, service: plausibility-notes }
+  - { prefix: /comment/v1/, service: comment-service }
+  - { prefix: /temporal/, service: temporal-job-service, timeout: 125s }
+  - { prefix: /law-changes/v1/, service: rechtsaenderungs-monitoring, rewrite: / }
+  - { prefix: /protocol/v1/, service: protocol-service }
+  - { prefix: /fpp/v1/, service: fpp-service }
+  - { prefix: /feedback/v1/, service: feedback-service }
+apiRoutesV2:
+  - { prefix: /v2/pls/, service: project-logic-service }
+  - { prefix: /v2/dms/, service: document-management-service, timeout: 120s }
+  - { prefix: /v2/vae/, service: administrative-file-draft }
+  - { prefix: /v2/examination/, service: examination-service }
+  - { prefix: /v2/feedback/, service: feedback-service }
+  - { prefix: /v2/fcs/, service: formal-completeness-check }
+  - { prefix: /v2/oms/, service: objections-management-service }
+  - { prefix: /v2/supplementary-requests/, service: supplementary-requests-service }
+  - { prefix: /v2/plausibility-notes/, service: plausibility-notes }
+  - { prefix: /v2/comment/, service: comment-service }
+# Prometheus endpoints the pools expose under the API prefix; blocked at the
+# edge like upstream does.
+metricsPaths:
+  - /api/identity/metrics
+  - /api/fpp/v1/metrics
 
 # ESO ClusterSecretStore created by the k8s-addons module.
 clusterSecretStore: aws-secrets-manager
@@ -61,6 +82,7 @@ secretsManager:
 hosts:
   frontend: "" # workflow.example.com
   keycloak: "" # auth-workflow.example.com
+  # checkov:skip=CKV_SECRET_6: example hostname in a comment, not a value
   temporal: "" # temporal-workflow.example.com
 
 gateway:
@@ -78,55 +100,37 @@ s3:
   # Seed object uploaded by terraform (bootstrap/gesetze-normen-seed.sql.gz)
   seedObjectKey: "bootstrap/gesetze-normen-seed.sql.gz"
 
-dbInit:
+# Database roles and the PLATFORM layer's databases against RDS (pre-install
+# job of this chart). The application's databases are created by the
+# upstream db-init chart inside the spark-platform umbrella (one application
+# database for the 15 pools, temporal, the agent data services); that chart
+# creates no roles by design, so the roles come from here.
+dbRoles:
   enabled: true
   image: public.ecr.aws/docker/library/postgres:16
   awsCliImage: public.ecr.aws/aws-cli/aws-cli:latest
-  # Database names follow the upstream umbrella DB_NAME defaults (these are
-  # what the deployed services connect to; the docker-compose list differs
-  # in places and is NOT authoritative for the Helm deployment).
+  # Databases this layer's own workloads need before the umbrella exists
+  # (Keycloak and SpiceDB start with this release), plus the one database
+  # whose content is the upstream seed dump (the dump carries psql-17
+  # directives the upstream db-init restore does not strip).
   databases:
-    - temporal
-    - spicedb
-    - keycloak
-    - project_logic_service
-    - temporal_job_service
-    - document_management_service
-    - administrative_file_draft
-    - comment_service
-    - examination_service
-    - feedback_service
-    - formal_completeness_check
-    - fpp_service
-    - identity_management_service
-    - objections_management_service
-    - plausibility_notes
-    - supplementary_requests_service
-    - gesetze_normen
-    - jura
-    - gesetzesbegruendung
-    - rechtsaenderungs_monitoring
-  # pgvector is enabled on all application databases (harmless where unused).
-  vectorDatabases:
-    - project_logic_service
-    - temporal_job_service
-    - document_management_service
-    - administrative_file_draft
-    - comment_service
-    - examination_service
-    - feedback_service
-    - formal_completeness_check
-    - fpp_service
-    - identity_management_service
-    - objections_management_service
-    - plausibility_notes
-    - supplementary_requests_service
-    - gesetze_normen
-    - jura
-    - gesetzesbegruendung
-    - rechtsaenderungs_monitoring
+    - { name: keycloak, owner: spark_keycloak }
+    - { name: spicedb, owner: spark_spicedb }
+    - { name: gesetze_normen, owner: spark_app, vector: true }
   # Seed target for the upstream gesetze-normen SQL dump.
   seedDatabase: gesetze_normen
+
+# SpiceDB (authorization store of the backend), plain Deployment against RDS.
+# Upstream 0.3.0 renders a SpiceDBCluster CR for the authzed operator instead;
+# the demo runs no operator (design.md).
+spicedb:
+  enabled: true
+  # Same version the 0.2.x upstream chart pinned for its operator.
+  image: ghcr.io/authzed/spicedb:v1.51.0
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
 
 keycloak:
   image: quay.io/keycloak/keycloak:26.0
@@ -169,6 +173,10 @@ litellm:
   # eu.* inference profile: cross-region routing stays inside the EU.
   vlmModelName: self-hosted/pixtral-large
   bedrockVlmModelId: eu.mistral.pixtral-large-2502-v1:0
+  # Further names served by the same vision model: the 0.3.0 EWMS extraction
+  # path hard-codes its OCR model name (modul-inhaltsextraktion config.py).
+  vlmAliases:
+    - ionos/lightonocr-2-1b
   # Model names exposed to the application — EXACTLY the identifiers the
   # upstream umbrella defaults reference, so no per-module overrides needed
   # (sole exception: VLLM_MODEL → vlmModelName, see above).
@@ -187,9 +195,23 @@ tei:
   # BGE-M3 ONNX warmup peaks well above the model size (verified OOMs on
   # first deploy with defaults) — cap batch tokens and give headroom.
   maxBatchTokens: 4096
+  # Texts per embedding request the router accepts (TEI default 32; the
+  # suche-und-zuordnung module sends 40).
+  maxClientBatchSize: 128
   resources:
     requests: { cpu: "2", memory: 6Gi }
     limits: { cpu: "4", memory: 16Gi }
+
+# In-cluster proxy that stamps the SPIFFE machine-identity header on the agent
+# modules' calls into the backend pools (upstream expects an Istio sidecar to
+# do this; the demo runs no mesh). Address for the modules:
+# http://machine-identity-proxy.<appNamespace>.svc.cluster.local
+machineIdentityProxy:
+  enabled: true
+  image: public.ecr.aws/nginx/nginx-unprivileged:1.29-alpine
+  # Service-account part of the asserted SPIFFE id (any name the allowlist
+  # AUTH_ALLOWED_MACHINE_IDENTITIES admits; it names the agent modules).
+  serviceAccountName: agent-modules
 
 temporalUi:
   enabled: true

@@ -25,15 +25,6 @@ resource "kubernetes_namespace_v1" "app" {
   depends_on = [helm_release.external_secrets]
 }
 
-# The upstream spicedb wrapper chart deploys its operator into this hardcoded
-# namespace but does not create it (documented as a platform prerequisite).
-resource "kubernetes_namespace_v1" "spicedb_operator" {
-  metadata {
-    name = "spicedb-operator"
-  }
-  depends_on = [helm_release.external_secrets]
-}
-
 # --- Storage: gp3 as default StorageClass -------------------------------------
 
 resource "kubernetes_storage_class_v1" "gp3" {
@@ -227,7 +218,6 @@ resource "helm_release" "cluster_config" {
     route53ZoneId     = var.route53_zone_id
     acmeEmail         = var.acme_email
     platformNamespace = var.platform_namespace
-    appNamespace      = var.app_namespace
     allowedCidrs      = var.allowed_cidrs
     certificate = {
       secretName = "spark-demo-tls"

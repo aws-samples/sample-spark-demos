@@ -55,8 +55,8 @@ bold "3/6 ExternalSecrets synced"
 NOT_READY=$(kubectl get externalsecrets -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | awk '$2 != "True" {print $1}' | head -5 || true)
 if [ -z "$NOT_READY" ]; then ok "all ExternalSecrets synced"; else fail "not synced: $NOT_READY"; fi
 
-bold "4/6 Platform (Keycloak, LiteLLM, TEI)"
-for deploy in keycloak litellm tei; do
+bold "4/6 Platform (Keycloak, LiteLLM, TEI, SpiceDB)"
+for deploy in keycloak litellm tei spicedb; do
   if kubectl -n "$PLATFORM_NS" rollout status deploy/"$deploy" --timeout=300s > /dev/null 2>&1; then
     ok "$PLATFORM_NS/$deploy"
   else
@@ -74,12 +74,57 @@ if [ "$TOTAL" -gt 0 ] && [ -z "$NOT_READY" ]; then
 else
   fail "pods not Ready: $(echo "$NOT_READY" | head -5 | tr '\n' ' ')"
 fi
+# 0.3.0: the 15 spark-backend pools share one image; each must report its
+# own API_POOL (a pool without it serves nothing) and the three worker
+# pools plus the agent modules must poll their Temporal task queues — a
+# worker whose first connect was refused keeps its pod Running with no
+# poller (README E). Pollers are read from the Temporal frontend.
+POOLS=$(kubectl -n "$APP_NS" get deploy -l app.kubernetes.io/part-of=spark-backend --no-headers 2>/dev/null | wc -l | tr -d ' ')
+[ "$POOLS" = "15" ] && ok "15 spark-backend pools deployed" || fail "spark-backend pools: $POOLS (expected 15)"
+ADMIN_POD=$(kubectl -n "$APP_NS" get pods -l app.kubernetes.io/component=admintools -o name 2>/dev/null | head -1)
+if [ -n "$ADMIN_POD" ]; then
+  MISSING=""
+  for q in orchestration dms project_logic_service extraction anonymisierung formale-pruefung llm-custom; do
+    POLLERS=$(kubectl -n "$APP_NS" exec "$ADMIN_POD" -- temporal task-queue describe --task-queue "$q" --namespace default --output json 2>/dev/null | python3 -c 'import sys,json
+d=json.load(sys.stdin); print(len(d.get("pollers") or d.get("workflowTaskPollers") or []))' 2>/dev/null || echo 0)
+    [ "${POLLERS:-0}" -gt 0 ] || MISSING="$MISSING $q"
+  done
+  [ -z "$MISSING" ] && ok "Temporal pollers on every checked task queue" || fail "no Temporal poller on:$MISSING"
+else
+  fail "temporal admintools pod not found (poller check skipped)"
+fi
 
 bold "6/6 Endpoints"
+# A SecurityPolicy Envoy Gateway rejects as Invalid leaves its routes with NO
+# policy — every page public (observed: an unsupported field combination,
+# /app/ answered 200 to an anonymous request). Read the status, not the fact
+# that the object exists.
+NOT_ACCEPTED=$(kubectl -n "$PLATFORM_NS" get securitypolicies.gateway.envoyproxy.io -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.ancestors[0].conditions[?(@.type=="Accepted")].status}{"\n"}{end}' 2>/dev/null | awk '$2 != "True" {print $1}' || true)
+[ -z "$NOT_ACCEPTED" ] && ok "every SecurityPolicy accepted by the gateway" || fail "SecurityPolicy not accepted: $NOT_ACCEPTED"
+# Owner-reported 2026-10-20: "400 Request Header Or Cookie Too Large" from the
+# frontend nginx and 431 from the pools, because the browser still carried the
+# session cookies of earlier deployments (Envoy Gateway suffixes its cookie
+# names per SecurityPolicy instance). The gateway verifies the session and
+# forwards the token as Authorization; every frontend-host rule must drop the
+# Cookie header before the upstream.
+KEEPING=$(kubectl -n "$PLATFORM_NS" get httproute frontend frontend-api-v1 frontend-api-v2 -o json 2>/dev/null | python3 -c '
+import sys, json
+for r in json.load(sys.stdin)["items"]:
+    for i, rule in enumerate(r["spec"]["rules"]):
+        drops = [h for f in rule.get("filters", []) if f.get("type") == "RequestHeaderModifier" for h in f["requestHeaderModifier"].get("remove", [])]
+        if "cookie" not in [h.lower() for h in drops]: print("%s[%d]" % (r["metadata"]["name"], i))' 2>/dev/null || echo "unreadable")
+[ -z "$KEEPING" ] && ok "frontend-host routes drop the Cookie header before the upstream" || fail "rules still forwarding cookies: $KEEPING"
 for url in "$KEYCLOAK_URL/realms/local/.well-known/openid-configuration" "$FRONTEND_URL"; do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$url" || echo "000")
   # Behind OIDC the frontend answers 302 → login; both count as "reachable".
   if [[ "$code" =~ ^(200|302)$ ]]; then ok "$url → $code"; else fail "$url → $code"; fi
+done
+# The API prefixes of the 0.3.0 contract sit behind the same login: an
+# anonymous call must be redirected (302), never answered or 404ed by the
+# gateway (a 404 here means the route is missing).
+for path in /api/identity/me /api/pls/v1/projects /api/v2/dms/documents /api/temporal/workflows; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$FRONTEND_URL$path" || echo "000")
+  [ "$code" = "302" ] && ok "$path → 302 (login)" || fail "$path → $code (expected 302)"
 done
 
 echo

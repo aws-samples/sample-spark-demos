@@ -1,16 +1,20 @@
-{{- if .Values.dbInit.enabled }}
-# Database bootstrap against RDS. Mirrors the upstream docker-compose
-# postgresql_init_sql/seed logic 1:1 as a Kubernetes pre-install job:
-#   - dedicated roles (app, temporal, keycloak, spicedb)
-#   - all application databases incl. pgvector extension
-#   - gesetze-normen seed (downloaded from S3, uploaded there by terraform
-#     from the unmodified upstream submodule)
-# Idempotent: databases/roles are created only when absent; the seed is
-# only imported into an empty gesetze-normen database.
+{{- if .Values.dbRoles.enabled }}
+# Database roles and the platform layer's databases against RDS, as a
+# pre-install job of this release:
+#   - dedicated roles (app, temporal, keycloak, spicedb) — the upstream
+#     db-init chart (inside the spark-platform umbrella, next release) creates
+#     the application's databases but no roles, by design
+#   - the databases this layer's own workloads open before the umbrella
+#     exists (keycloak, spicedb) and the gesetze-normen database with the
+#     upstream seed (the dump carries psql-17 directives that db-init's
+#     restore does not strip; the seed is downloaded from S3, uploaded there by
+#     terraform from the unmodified upstream submodule)
+# Idempotent: roles/databases are created only when absent; the seed is only
+# imported into an empty gesetze-normen database.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: db-init-scripts
+  name: db-roles-scripts
   namespace: {{ .Release.Namespace }}
   labels: {{- include "spark-platform.labels" . | nindent 4 }}
   annotations:
@@ -37,51 +41,36 @@ data:
       fi
     done
 
-    echo "==> Creating databases"
-    owner_for() {
-      case "$1" in
-        temporal) echo spark_temporal ;;
-        keycloak) echo spark_keycloak ;;
-        spicedb)  echo spark_spicedb ;;
-        *)        echo spark_app ;;
-      esac
-    }
-    {{- range .Values.dbInit.databases }}
-    if ! db_exists "{{ . }}"; then
-      psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"{{ . }}\" OWNER $(owner_for "{{ . }}")"
-      echo "    database {{ . }} created"
+    echo "==> Creating the platform layer's databases"
+    {{- range .Values.dbRoles.databases }}
+    if ! db_exists "{{ .name }}"; then
+      psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"{{ .name }}\" OWNER {{ .owner }}"
+      echo "    database {{ .name }} created"
     fi
+    {{- if .vector }}
+    psql -v ON_ERROR_STOP=1 -d "{{ .name }}" -c "CREATE EXTENSION IF NOT EXISTS vector"
+    {{- end }}
     {{- end }}
 
-    echo "==> Enabling pgvector"
-    {{- range .Values.dbInit.vectorDatabases }}
-    psql -v ON_ERROR_STOP=1 -d "{{ . }}" -c "CREATE EXTENSION IF NOT EXISTS vector"
-    {{- end }}
-
-    echo "==> Temporal visibility database"
-    if ! db_exists "temporal_visibility"; then
-      psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE temporal_visibility OWNER spark_temporal"
-    fi
-
-    echo "==> Seeding {{ .Values.dbInit.seedDatabase }} (skipped when tables already present)"
-    tables=$(psql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'" -d "{{ .Values.dbInit.seedDatabase }}")
+    echo "==> Seeding {{ .Values.dbRoles.seedDatabase }} (skipped when tables already present)"
+    tables=$(psql -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'" -d "{{ .Values.dbRoles.seedDatabase }}")
     if [ "${tables}" = "0" ] && [ -f /work/seed.sql.gz ]; then
       # sed mirrors upstream compose: strip pg_dump-17-only statements.
       gunzip -c /work/seed.sql.gz \
         | sed -e '/^\\restrict /d' -e '/^\\unrestrict /d' -e '/^SET transaction_timeout/d' \
-        | psql -v ON_ERROR_STOP=1 -d "{{ .Values.dbInit.seedDatabase }}"
-      psql -v ON_ERROR_STOP=1 -d "{{ .Values.dbInit.seedDatabase }}" \
-        -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO spark_app; ALTER DATABASE {{ .Values.dbInit.seedDatabase | quote }} OWNER TO spark_app"
+        | psql -v ON_ERROR_STOP=1 -d "{{ .Values.dbRoles.seedDatabase }}"
+      psql -v ON_ERROR_STOP=1 -d "{{ .Values.dbRoles.seedDatabase }}" \
+        -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO spark_app; ALTER DATABASE {{ .Values.dbRoles.seedDatabase | quote }} OWNER TO spark_app"
       echo "    seed imported"
     else
       echo "    seed skipped (tables=${tables})"
     fi
-    echo "==> Database init finished"
+    echo "==> Database roles finished"
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: db-init
+  name: db-roles
   namespace: {{ .Release.Namespace }}
   labels: {{- include "spark-platform.labels" . | nindent 4 }}
   annotations:
@@ -93,12 +82,12 @@ spec:
   activeDeadlineSeconds: 1800
   template:
     metadata:
-      labels: {{- include "spark-platform.selectorLabels" "db-init" | nindent 8 }}
+      labels: {{- include "spark-platform.selectorLabels" "db-roles" | nindent 8 }}
     spec:
       restartPolicy: OnFailure
       initContainers:
         - name: fetch-seed
-          image: {{ .Values.dbInit.awsCliImage }}
+          image: {{ .Values.dbRoles.awsCliImage }}
           command: ["/bin/sh", "-c"]
           args:
             - aws s3 cp "s3://{{ .Values.s3.dmsBucket }}/{{ .Values.s3.seedObjectKey }}" /work/seed.sql.gz && ls -la /work
@@ -112,8 +101,8 @@ spec:
           volumeMounts:
             - { name: work, mountPath: /work }
       containers:
-        - name: init-db
-          image: {{ .Values.dbInit.image }}
+        - name: db-roles
+          image: {{ .Values.dbRoles.image }}
           command: ["/bin/bash", "/scripts/init.sh"]
           env:
             - name: PGUSER
@@ -133,11 +122,11 @@ spec:
             - { name: work, mountPath: /work }
       volumes:
         - name: scripts
-          configMap: { name: db-init-scripts, defaultMode: 0755 }
+          configMap: { name: db-roles-scripts, defaultMode: 0755 }
         - name: work
           emptyDir: {}
 ---
-# Per-role passwords for the init job (hooked so it exists before the job).
+# Per-role passwords for the job (hooked so it exists before the job).
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:

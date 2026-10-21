@@ -1,0 +1,54 @@
+{{- if .Values.machineIdentityProxy.enabled }}
+# nginx configuration of the machine-identity proxy; its own file so the
+# Deployment (machine-identity-proxy.yaml) can hash it and roll on a change.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: machine-identity-proxy
+  namespace: {{ .Values.appNamespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+data:
+  default.conf: |
+    # One upstream per pool the modules talk to; everything else goes to the
+    # document-management pool (every pool serves the whole API surface).
+    map $uri $pool {
+      default                        {{ .Values.appReleaseName }}-document-management-service;
+      ~^/api/internal/               {{ .Values.appReleaseName }}-temporal-job-service;
+      ~^/api/temporal/               {{ .Values.appReleaseName }}-temporal-job-service;
+      ~^/api/pls/                    {{ .Values.appReleaseName }}-project-logic-service;
+      ~^/api/agent-orchestration/    {{ .Values.appReleaseName }}-agent-orchestration-service;
+    }
+    # The three legal-data services (python, same authentification package,
+    # AUTH_MODE=strict) under /law/<service>/<their path>; the prefix is
+    # stripped. modul-rechtsmethodik (LAW_DATABASE_*_URL) and the
+    # examination pool (LAW_DATABASE_BASE_URL) call them without a credential
+    # (observed 2026-10-20: every MVPWorkflow failed, LoadNormWorkflow 401 on
+    # /documents/<jurabk>, 384 requests). Keyed on $request_uri: $uri is
+    # already rewritten when the variable is read.
+    map $request_uri $law_upstream {
+      default                        {{ .Values.appReleaseName }}-gesetze-normen-db-service.{{ .Values.appNamespace }}.svc.cluster.local:8000;
+      ~^/law/gesetze-normen/         {{ .Values.appReleaseName }}-gesetze-normen-db-service.{{ .Values.appNamespace }}.svc.cluster.local:8000;
+      ~^/law/gesetzesbegruendung/    {{ .Values.appReleaseName }}-gesetzesbegruendung-db-service.{{ .Values.appNamespace }}.svc.cluster.local:80;
+      ~^/law/jura/                   {{ .Values.appReleaseName }}-jura-db-service.{{ .Values.appNamespace }}.svc.cluster.local:80;
+    }
+    server {
+      listen 8080;
+      resolver kube-dns.kube-system.svc.cluster.local valid=30s;
+      client_max_body_size 0;
+      proxy_read_timeout 300s;
+      location = /healthz { return 200 "ok\n"; }
+      location ^~ /law/ {
+        rewrite ^/law/[a-z-]+(/.*)$ $1 break;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Client-Cert "By=spiffe://cluster.local/ns/{{ .Values.appNamespace }}/sa/{{ .Values.appReleaseName }}-backend;URI=spiffe://cluster.local/ns/{{ .Values.appNamespace }}/sa/{{ .Values.machineIdentityProxy.serviceAccountName }}";
+        proxy_pass http://$law_upstream;
+      }
+      location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Client-Cert "By=spiffe://cluster.local/ns/{{ .Values.appNamespace }}/sa/{{ .Values.appReleaseName }}-backend;URI=spiffe://cluster.local/ns/{{ .Values.appNamespace }}/sa/{{ .Values.machineIdentityProxy.serviceAccountName }}";
+        proxy_pass http://$pool.{{ .Values.appNamespace }}.svc.cluster.local:80;
+      }
+    }
+{{- end }}

@@ -42,7 +42,9 @@ data:
       -s ssoSessionIdleTimeout=86400 \
       -s ssoSessionMaxLifespan=86400
 
-    for role in admin user service; do
+    # test-role-switcher: realm role the 0.3.0 bootstrap adds (role switcher
+    # in the frontend, off in the demo); created so the realm matches upstream.
+    for role in admin user service test-role-switcher; do
       "$KCADM" get "roles/$role" -r "$REALM" >/dev/null 2>&1 || \
         "$KCADM" create roles -r "$REALM" -s "name=$role"
     done

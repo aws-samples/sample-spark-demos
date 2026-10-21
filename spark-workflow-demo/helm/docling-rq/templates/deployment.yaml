@@ -1,0 +1,204 @@
+{{- if .Values.app.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "docling-rq.fullname" . }}
+  labels:
+    {{- include "docling-rq.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "docling-rq.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "docling-rq.labels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "docling-rq.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 120 }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: docling-serve
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - containerPort: 5001
+              name: http
+          env:
+            - name: UVICORN_HOST
+              value: "0.0.0.0"
+            - name: UVICORN_PORT
+              value: "5001"
+            - name: UVICORN_TIMEOUT_KEEP_ALIVE
+              value: {{ .Values.docling.uvicornTimeoutKeepAlive | quote }}
+            - name: DOCLING_SERVE_ENABLE_UI
+              value: {{ .Values.docling.enableUI | quote }}
+            - name: DOCLING_SERVE_LOAD_MODELS_AT_BOOT
+              value: {{ .Values.docling.loadModelsAtBoot | quote }}
+            - name: DOCLING_DEVICE
+              value: {{ .Values.docling.device | quote }}
+            {{- include "docling-rq.doclingEnv" . | nindent 12 }}
+            {{- $extraEnv := include "docling-rq.containerEnv" . | trim }}
+            {{- if $extraEnv }}
+            {{- $extraEnv | nindent 12 }}
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "docling-rq.sharedVolumeMounts" . | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: {{ (.Values.startupProbe | default dict).initialDelaySeconds | default 30 }}
+            periodSeconds: {{ (.Values.startupProbe | default dict).periodSeconds | default 10 }}
+            timeoutSeconds: {{ (.Values.startupProbe | default dict).timeoutSeconds | default 10 }}
+            failureThreshold: {{ (.Values.startupProbe | default dict).failureThreshold | default 60 }}
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            periodSeconds: {{ (.Values.livenessProbe | default dict).periodSeconds | default 30 }}
+            timeoutSeconds: {{ (.Values.livenessProbe | default dict).timeoutSeconds | default 15 }}
+            failureThreshold: {{ (.Values.livenessProbe | default dict).failureThreshold | default 5 }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            periodSeconds: {{ (.Values.readinessProbe | default dict).periodSeconds | default 15 }}
+            timeoutSeconds: {{ (.Values.readinessProbe | default dict).timeoutSeconds | default 15 }}
+            failureThreshold: {{ (.Values.readinessProbe | default dict).failureThreshold | default 3 }}
+            successThreshold: 1
+      volumes:
+        {{- include "docling-rq.sharedVolumes" . | nindent 8 }}
+{{- end }}
+{{- /*
+Worker Deployment — same image, RQ worker mode.  Node placement (nodeSelector +
+tolerations) determines CPU vs GPU.  Probes and HTTP port are not needed here.
+*/}}
+{{- if .Values.worker.enabled }}
+{{- $w := .Values.worker }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "docling-rq.fullname" . }}-worker
+  labels:
+    {{- include "docling-rq.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ $w.replicaCount | default 2 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "docling-rq.name" . }}
+      app.kubernetes.io/instance: {{ include "docling-rq.fullname" . }}-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "docling-rq.name" . }}
+        app.kubernetes.io/instance: {{ include "docling-rq.fullname" . }}-worker
+        app.kubernetes.io/component: worker
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $w.terminationGracePeriodSeconds | default 120 }}
+      {{- with $w.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $w.podSecurityContext }}
+      initContainers:
+        - name: init-passwd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          command:
+            - sh
+            - -c
+            - cp /etc/passwd /tmp-passwd/passwd && echo "docling:x:1000:1000:docling:/home/docling:/bin/sh" >> /tmp-passwd/passwd
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: passwd
+              mountPath: /tmp-passwd
+      {{- end }}
+      containers:
+        - name: docling-serve-rq-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["docling-serve"]
+          args: ["rq-worker"]
+          {{- with $w.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: HOME
+              value: "/home/docling"
+            - name: DOCLING_SERVE_LOAD_MODELS_AT_BOOT
+              value: {{ $w.loadModelsAtBoot | default .Values.docling.loadModelsAtBoot | quote }}
+            - name: DOCLING_DEVICE
+              value: {{ $w.device | default "cpu" | quote }}
+            {{- include "docling-rq.doclingEnv" . | nindent 12 }}
+            {{- with $w.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with $w.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "docling-rq.sharedVolumeMounts" . | nindent 12 }}
+            {{- if $w.podSecurityContext }}
+            - name: passwd
+              mountPath: /etc/passwd
+              subPath: passwd
+              readOnly: true
+            {{- end }}
+      {{- with $w.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        {{- include "docling-rq.sharedVolumes" . | nindent 8 }}
+        {{- if $w.podSecurityContext }}
+        - name: passwd
+          emptyDir: {}
+        {{- end }}
+{{- end }}

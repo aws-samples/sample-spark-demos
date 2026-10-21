@@ -135,15 +135,16 @@ this demo's Terraform/Helm. The submodule itself is never modified — see
 
 | Component | Hosting | Service |
 |---|---|---|
-| SPARK Workflow (frontend, 19 services, 9 AI modules) | EKS | Upstream Helm charts (`00-spark-workflow` umbrella), images from `registry.opencode.de` (v0.2.1) |
+| SPARK Workflow (frontend, 15 backend pools of one modulith image, 9 AI modules + 3 data services) | EKS | Upstream Helm charts (`00-umbrella/spark-platform`, v0.3.0), images from `registry.opencode.de` (v0.3.0) |
 | Workflow engine (Temporal) | EKS | Official Temporal chart (upstream wrapper), state in RDS |
-| PostgreSQL + pgvector (22 databases) | **AWS Managed** | Amazon RDS for PostgreSQL |
+| PostgreSQL + pgvector (11 databases) | **AWS Managed** | Amazon RDS for PostgreSQL; the application's databases are created by the upstream `db-init` chart, the platform layer's by our `db-roles` job |
 | Object storage (documents, Temporal payloads, quarantine) | **AWS Managed** | Amazon S3 (S3-compatible interface, presigned URLs) |
-| Redis (Docling RQ broker) | **AWS Managed** (optional) | Amazon ElastiCache for Valkey |
-| Vector database (Qdrant) | EKS | Upstream chart |
+| Redis (Docling RQ broker) | **AWS Managed** | Amazon ElastiCache for Valkey |
+| Vector database (Qdrant) | EKS | Official qdrant chart 1.17.0 (upstream 0.3.0 treats Qdrant as an external endpoint) |
 | Identity (Keycloak) + oauth2-proxy | EKS | Open-source in-cluster deployment, state in RDS |
-| Authorization (SpiceDB + operator) | EKS | Upstream chart, state in RDS |
-| Document processing (Docling Serve) | EKS | CPU mode by default, GPU node group optional |
+| Authorization (SpiceDB) | EKS | Plain Deployment in the platform chart (no operator), state in RDS |
+| Document processing (Docling Serve) | EKS | `docling-rq` chart vendored from upstream 0.2.3 (`helm/docling-rq`); CPU mode by default, GPU node group optional |
+| Service-to-service identity (machine-identity proxy) | EKS | nginx in the app namespace that stamps the SPIFFE header the backend expects from a mesh sidecar (upstream: Istio) |
 | LLM gateway (LiteLLM) | EKS | Serves the upstream model names, backend Amazon Bedrock (swappable) |
 | API routing (Envoy Gateway) | EKS | CNCF Envoy Gateway behind an AWS NLB |
 | Secrets | **AWS Managed** | AWS Secrets Manager, synchronized via External Secrets Operator |
@@ -158,12 +159,19 @@ this demo's Terraform/Helm. The submodule itself is never modified — see
 
 ```bash
 # in the repo root: cp .env.example .env && set the values
-make init      # terraform init
+#   IMPORTANT: set ACME_EMAIL to YOUR address — Let's Encrypt issues the
+#   TLS certificate to it. With the placeholder the certificate is not
+#   issued and the demo stays on plain HTTP (port 80) until you fix it.
+make init      # terraform init (optional — apply/plan/destroy run it for you)
 make plan      # preview
-make apply     # bring up the demo
+make apply     # terraform init + bring up the demo
 make destroy   # full teardown
 make validate  # fmt-check + terraform validate (no AWS access)
 ```
+
+`make apply` runs `terraform init` itself, so a fresh checkout needs no
+separate step. If the first `make apply` ever reports an uninitialised
+backend, run `make init` once and retry.
 
 ### Users & roles
 
@@ -185,9 +193,9 @@ The demo follows the upstream identity model exactly (audited against
   verified) → Role mapping → assign realm role `user` (and `admin` if
   wanted). The app picks new users up automatically via its `/users`
   endpoint. Admin console URL and credentials: see [DEMO.md](DEMO.md) §1/§11.
-- The upstream seeds for lookup data (procedure types etc.) run
-  automatically after every deploy; opt out with
-  `SPARK_WORKFLOW_SEED_JOBS_ENABLED=false` in `.env`.
+- Lookup data (procedure types, statuses) is seeded by the backend itself at
+  its first start from the catalog shipped in the image (0.3.0; the 0.2.x
+  seed jobs are gone). Own catalogs go to `/seed/catalog` (upstream docs).
 
 ### LLM integration
 
@@ -201,20 +209,21 @@ The demo follows the upstream identity model exactly (audited against
 The upstream code (submodule) is **unmodified**. All deviations live in
 this repo: Terraform (`terraform/`), demo values overlay
 (`helm/values/spark-workflow.demo.yaml.tftpl`), platform chart
-(`helm/platform/`), cluster-config chart (`helm/cluster-config/`), and a
-Helm postrenderer (`helm/postrender-spark-workflow.sh`). Every deviation was
-verified during the first live deploy; "observed" = an error that actually
-occurred and forced the change.
+(`helm/platform/`), cluster-config chart (`helm/cluster-config/`), the
+vendored Docling chart (`helm/docling-rq/`) and a Helm postrenderer hook
+(`helm/postrender-spark-workflow.sh`, a pass-through since 0.3.0). Every
+deviation was verified during a live deploy from zero; "observed" = an error
+that actually occurred and forced the change.
 
 ### A. AWS managed services instead of in-cluster operation
 
 | Component | Upstream expectation | Demo on AWS | Why |
 |---|---|---|---|
-| PostgreSQL (+pgvector) | CNPG cluster in-cluster ("Any PostgreSQL provider works") | **Amazon RDS for PostgreSQL 16**, one instance, all DBs (app DBs + `temporal`/`temporal_visibility` + `spicedb` + `keycloak`) | Explicitly supported by upstream; fully replaces the CNPG operator. DB/role creation + pgvector + the laws seed are handled by the idempotent `db-init` job (platform chart, pre-install hook) — logic taken 1:1 from the upstream compose, seed SQL is staged from the submodule to S3 by Terraform |
+| PostgreSQL (+pgvector) | Cloud SQL / any PostgreSQL; databases via the upstream `db-init` chart, roles pre-existing | **Amazon RDS for PostgreSQL 16**, one instance, 11 databases: `application` (all 15 pools), `temporal`/`temporal_visibility`, `spicedb`, `keycloak`, `gesetze_normen`, `jura`, `gesetzesbegruendung`, `rechtsaenderungs_monitoring`, `rechtsbegriffe` | Explicitly supported by upstream. The **upstream `db-init` chart** (inside the spark-platform umbrella) creates the application's databases and pgvector extensions, reading the RDS admin credentials from the ESO ClusterSecretStore (`guard.namePattern: ""` keeps the upstream-local names); it creates no roles by design, so the platform chart's `db-roles` pre-install job creates the four roles and the three databases the platform layer opens before the umbrella exists (`keycloak`, `spicedb`, and `gesetze_normen` with the upstream laws seed — the seed dump carries psql-17 directives the chart's restore does not strip). Seed SQL is staged from the submodule to S3 by Terraform |
 | Object storage | MinIO / S3-compatible (Rook/Ceph) | **Amazon S3** (4 buckets: dms, temporal-payloads, temporal-archival, quarantine) | The app speaks endpoint+keys incl. presigned URLs → S3 is the reference. CORS for browser uploads on the dms **and quarantine** buckets — with ClamAV enabled (default), presigned user uploads target the quarantine bucket first (observed: uploads failed in the browser until the quarantine bucket carried the CORS rule); access via a dedicated IAM user scoped to the buckets (the app expects static keys — documented demo deviation vs. short-lived credentials) |
-| Redis (Docling RQ broker) | Redis container in the docling-rq chart | **ElastiCache for Valkey** (TLS + AUTH, `rediss://`) | The chart natively supports an external Redis URL (`redis.enabled=false` + `redisUrl` secret) — a clean drop-in that demonstrates the managed-OSS pattern. Flag `SPARK_WORKFLOW_VALKEY_ENABLED` |
-| Secrets | External-Secrets-compatible service (e.g. Vault) | **AWS Secrets Manager** as the ESO backend | Exactly the ESO pattern required by upstream. Terraform generates ALL credentials and stores them in ASM; ExternalSecrets create the ~26 K8s secrets with the names/keys the upstream charts expect (extracted from a full rendering) |
-| LLM backend | Pharia AI / vLLM behind LiteLLM | **Bedrock `openai.gpt-oss-120b-1:0`** via LiteLLM (Pod Identity, `BEDROCK_REGION`, default `eu-central-1`) + **TEI** in-cluster for BGE-M3 | No GPU cluster needed; the model itself is open-weights. LiteLLM serves the models under **exactly the upstream names** `self-hosted/gpt-oss-120b` and `self-hosted/bge-m3` — so the 9 AI modules need **no** model-name overrides (single exception: `VLLM_MODEL`, see section D) |
+| Redis (Docling RQ broker) | Redis container in the (0.2.3) docling-rq chart | **ElastiCache for Valkey** (TLS + AUTH, `rediss://`), always provisioned | The vendored chart takes the broker from the `docling-rq-redis-url` Secret (`redisUrl.secretName`); its embedded Redis subchart is not carried over |
+| Secrets | External-Secrets-compatible service (e.g. Vault) | **AWS Secrets Manager** as the ESO backend | Exactly the ESO pattern required by upstream. Terraform generates ALL credentials and stores them in ASM; ExternalSecrets create the 13 Kubernetes Secrets the 0.3.0 charts reference (one `spark-backend-secrets` for all 15 pools via `envFrom`, one per data service, Temporal, LiteLLM, Docling; names from a full rendering — `.kiro/tools/render-workflow.sh` lists them) |
+| LLM backend | Pharia AI / vLLM behind LiteLLM | **Bedrock `openai.gpt-oss-120b-1:0`** via LiteLLM (Pod Identity, `BEDROCK_REGION`, default `eu-central-1`) + **TEI** in-cluster for BGE-M3 | No GPU cluster needed; the model itself is open-weights. LiteLLM serves the models under **exactly the upstream names** `self-hosted/gpt-oss-120b` and `self-hosted/bge-m3` — so the AI modules keep their upstream model names. Since 0.3.0 the modules no longer call LiteLLM for chat themselves: every `self-hosted/*` name routes to the Temporal queue `llm-custom`, served by the `llm-client` worker with `LITELLM_BASE_URL`; the `llm-ionos` queue stays on for the EWMS extraction path whose OCR model name (`ionos/lightonocr-2-1b`) is a code constant — LiteLLM serves that name with the vision model too |
 | VLM (vision) backend | `VLLM_MODEL=self-hosted/gpt-oss-120b` (upstream default) | **Bedrock Pixtral Large** via the EU profile `eu.mistral.pixtral-large-2502-v1:0`, served by LiteLLM as `self-hosted/pixtral-large`; overlay sets `VLLM_MODEL` to that name | gpt-oss-120b is text-only — the VLM stage sends image content blocks (observed: Bedrock 400 "This model doesn't support the image content block" on every element, `vlm-batch-processing` fails the document). Only weights-available vision model in the EU cross-region profiles; `BEDROCK_VLM_MODEL_ID` swaps it |
 | DNS/TLS | "cert-manager optional", ingress external | **Route53** (external-dns, source `gateway-httproute`) + **Let's Encrypt DNS-01** (cert-manager, Route53 solver) | Fully automatic given the hosted zone ID from `.env`; DNS-01 avoids the chicken-and-egg problem with HTTP reachability |
 | Kafka/MSK, Amazon MQ | — | **not used** | SPARK Workflow uses neither Kafka nor RabbitMQ |
@@ -239,12 +248,13 @@ occurred and forced the change.
 | **Envoy Gateway OIDC** (SecurityPolicy) instead of oauth2-proxy | Upstream names "Envoy + OIDC provider" as the target design; one auth point + native prefix rewrites in the gateway. oauth2-proxy remains as a fallback flag in the platform chart (`oauth2Proxy.enabled`) |
 | OIDC **back-channel via `backendRefs`** to the Keycloak service | Token redeem/JWKS via the public hostname = hairpin through the internet-facing NLB → fails from the Envoy pods (observed: 503 right after login). The front-channel (browser redirects) stays public |
 | **One SecurityPolicy per host** (frontend-oidc, temporal-oidc) instead of one policy for both routes | `redirectURL` must match the host where the flow starts: Envoy's oauth2 filter stores CSRF/session cookies on the originating host — if the callback lands on a different host, the cookies are missing (observed: "OAuth flow failed" after login on the Temporal UI). Each host also needs its own redirect URI in the Keycloak client (the bootstrap job registers both) |
-| **15 API routes with URLRewrite** on the frontend host | The routing contract lives in the frontend code (`configureClients.ts` + Vite proxy): `/api/<prefix>` → service, prefix stripped (exception `/temporal`). Upstream does not ship these routes ("ingress external") |
+| **26 API routes on the frontend host, paths unchanged** (two HTTPRoutes: 16 `/api/<module>/v1/` + `/api/identity/` + `/api/temporal/` rules, 10 `/api/v2/<module>/` rules; `/api/law-changes/v1` is the only rewrite) | The 0.3.0 contract is the upstream `gateway-routes` chart's dashboard-api route table: the SPA's single client calls `/api/...`, every spark-backend pool serves the whole `/api` surface and the pool only separates the load. The upstream chart itself is not installed (its OIDC back-channel targets the public Keycloak host on 443 — the NLB hairpin that fails from the Envoy pods — and it needs a second confidential client); its route table is reproduced in `helm/platform/values.yaml` (`apiRoutesV1/V2`). Prometheus endpoints under `/api/.../metrics` are blocked at the edge like upstream does |
 | **`/app` prefix strip** as a separate HTTPRoute (`frontend-app`) | The frontend image templates `VITE_BASE_URL=/app` into index.html, but its nginx serves from the web root — the gateway must rewrite `/app/...` → `/...` (observed: page loads via the nginx SPA fallback but every `/app/assets/*` request 404s → blank page). Separate route because the frontend route already carries 16 rules (the Kubernetes maximum per HTTPRoute); Gateway API matches the longest prefix across routes of the same hostname |
 | BackendRef **port 80** | All upstream service charts expose service port 80 (observed: `ResolvedRefs=False PortNotFound` degraded the entire route) |
-| **`AUTH_MODE=optional_verify_dry_run`** (instead of `disabled`/`strict`) | The mode upstream built for exactly this case: JWTs are **actually verified against Keycloak** (otherwise `/api/identity/me` can only return 401 — `disabled` does not parse a token at all), SpiceDB permission checks run as a dry-run. `strict` would require complete SpiceDB relationship seeds, which v0.2.1 does not ship. Switchable via the `auth_mode` variable |
+| **`AUTH_MODE=strict`** (0.3.0 accepts `strict` or `disabled`; the 0.2.x dry-run mode is gone) | Every pool verifies the Bearer token Envoy forwards after the perimeter login (`forwardAccessToken`) and enforces SpiceDB permissions; `disabled` leaves `auth.user` null and `/api/identity/me` answers 401. The privileged Keycloak client of the identity module (`AUTH_PRIVILEGED_*`, all three or none) is the realm's own confidential client, as in the upstream local stack — upstream's example values set two of the three and every pool refuses to start |
+| **Machine-identity proxy** for the agent modules' calls into the pools (`DMS_BASE_URL`, `TEMPORAL_JOB_SERVICE_URL` → `http://machine-identity-proxy.<app ns>`) and for every call into the three legal-data services (`LAW_DATABASE_*` of `modul-rechtsmethodik` and `LAW_DATABASE_BASE_URL` of the examination pool → `…/law/<service>/…`, prefix stripped) | In strict mode a service-to-service call is identified by the SPIFFE id in the `x-forwarded-client-cert` header that an Istio sidecar sets from the caller's mTLS certificate (`AUTH_ALLOWED_MACHINE_IDENTITIES`); the Python modules carry no credential of their own (observed from zero: every `dms_get_file_metadata` activity 401, the extraction workflow failed; after the first owner session every `MVPWorkflow` failed on `LoadNormWorkflow` 401 against the gesetze-normen service — the material completeness check showed "0 von 33 Normen geprüft" and no findings). The demo runs no mesh, so a small nginx in the app namespace stamps the header for exactly these hops. Trust boundary unchanged: without a mesh the pools accept that header from any pod in the cluster anyway (THREAT-MODEL R-1); production replaces the proxy with the mesh |
 | Keycloak: realm `local`, client `local-client`, audience mapper, demo user | Bootstrap job in the platform chart, derived 1:1 from the upstream script `docker/keycloak/bootstrap.sh` (same names → no hidden couplings) |
-| identity-management-service gets `AUTH_CLIENT_ID` in addition to `AUTH_CLIENT_SECRET` | `GET /users` (user listing in the UI) fetches an admin-API token via client_credentials; the shared auth lib does not fall back to `AUTH_AUDIENCE` for this (observed: 500 "OIDC token request failed" on /users while /me/roles worked). Matches the upstream values contract (`identity-management-service` chart documents both) |
+| **One ConfigMap and one Secret for all 15 pools** (`global.backend.config` / `secretRefs`) with the complete required set, reference `process-compose.yaml` of the upstream repo | Every pool parses the env of EVERY feature at startup (`features.ts`): one required variable missing in any feature stops all 15 pools. Upstream's example values cover a fraction of the set; `ENV=production` requires `CLAMAV_ENABLED=true` plus the four `QUARANTINE_*` variables; `TEMPORAL_JOB_SERVICE_URL` is required by four agent modules and set by no 0.3.0 values file |
 | **Keycloak admin surface denied at the gateway**: `/admin/master/**` + `/realms/master/**` → 403 via an `HTTPRouteFilter` `directResponse` on its own HTTPRoute (`keycloak-admin-denied`) | Upstream routes the whole Keycloak host with a single catch-all rule, so the `master` realm's admin console was reachable from the internet with only the bootstrap admin password in front of it (observed: a security scan of the live deployment cited `/realms/master/protocol/openid-connect/auth?client_id=security-admin-console`). Scope is deliberately **not** `/admin`: the console for every realm lives under `/admin/master/console`, while the token-protected admin REST API is `/admin/realms/<realm>` — and identity-management-service calls exactly that through the public hostname (`AUTH_BASE_URL`), so a blanket deny breaks `GET /users`. Verified after the change: console/master 403, `/admin/realms/local/users` 401 unauthenticated and 200 through the app, scripted OIDC login green. Admin access via `kubectl port-forward svc/keycloak 8080:8080` |
 | **Source-IP allowlist on the public NLB**: `DEMO_ALLOWED_CIDRS` (root `.env`, comma-separated) → `loadBalancerSourceRanges` on the EnvoyProxy `envoyService` | A company or personal AWS account may not serve anything to unauthenticated callers, and a security scan counts the OIDC **login redirect** as exactly that — so route-level OIDC is not sufficient and the restriction has to sit at L4, where one value covers all three hostnames and both `:80`/`:443`. **Empty = open to the internet** (the from-zero default). Alternative for occasional demos: leave it open and `make destroy` afterwards |
 | **Optional corporate identity provider**: `EXTERNAL_OIDC_ISSUER_URL`/`_CLIENT_ID`/`_CLIENT_SECRET` (root `.env`, any OIDC issuer) → the bootstrap job registers it as identity provider `corporate` in realm `local` (endpoints from the issuer's discovery document, roles `admin`+`user` via hardcoded-role mappers) and configures the realm's **Identity Provider Redirector** with it as default; the `keycloak-admin-denied` route additionally denies the realm's account console (`/realms/local/account`) | The apps keep trusting the demo realm (client, audience mapper, `identity-management-service` and its admin REST calls unchanged); only the authentication moves to the issuer, and the Keycloak login page never renders a password form — an anonymous visitor gets nothing but the redirect to the issuer. **Empty = off**: the demo user as before, which is the mode a customer or reviewer tests with. Values live in Secrets Manager (`…/auth/external-oidc`), nothing provider-specific in the repository. Redirect URI to register at the issuer: `https://<keycloak host>/realms/local/broker/corporate/endpoint`; the client must issue an `email` claim. Verified live 2026-10-20 (anonymous, cookie jar): `/app/` and the Temporal UI end at the issuer's sign-in, the account console answers 403, the realm admin REST API 401 (observed on the way: `kcadm create … import-config` prints the discovered endpoints only with `-o`, and the account console was the last anonymous 200 on the host) |
@@ -253,67 +263,69 @@ occurred and forced the change.
 
 | Problem (observed) | Workaround |
 |---|---|
-| The spicedb chart passes `--crd=/crds` — invalid for operator v1.23.0 (prints usage, crashes) | The postrenderer removes the argument; the **SpiceDBCluster CRD is vendored** and installed in the cluster-config chart (the operator only installs CRDs at runtime — too late for Helm, which validates the CR in the same release) |
-| Operator v1.23 still reconciles its CRD at startup; the minimal chart RBAC does not allow it (`cannot update customresourcedefinitions`) | Name-scoped ClusterRole only for `spicedbclusters.authzed.com` + role supplement for PDB/EndpointSlices (diff against the official `config/rbac/role.yaml` of the operator release) |
-| The spicedb chart deploys a **CNPG `Cluster`** (CRD not present) and expects namespace `spicedb-operator` | `cluster.database.enabled=false` (SpiceDB → RDS via `datastore_uri`, supported by the chart); the namespace is created by Terraform |
-| docling-rq: the GKE GPU `nodeSelector` + `nvidia.com/gpu` requests can **not** be removed via values (Helm merges maps; `null` overrides are dropped across two subchart levels, helm#12511) | The postrenderer strips both in CPU mode; CPU image `quay.io/docling-project/docling-serve-cpu`. GPU mode (`SPARK_WORKFLOW_GPU_ENABLED`) uses its own pool selector |
-| The Temporal wrapper disables the schema jobs ("managed externally via CNPG") → `schema_version does not exist`, the server crashloops | Official chart schema jobs enabled (`schema.setup/update.enabled=true`); `createDatabase` stays off (the db-init job creates the DBs with the correct owner) |
-| Nobody creates the Temporal namespace `default` → the `search-attributes` hook waits forever, the Helm install hangs | `server.config.namespaces.create=true` (chart feature) |
-| The spicedb chart renders a ServiceAccount **`default`** → Helm refuses to install over the K8s auto-created SA | SA adoption before the install (Terraform, server-side apply with separate field managers for label/annotation) |
-| The `landingpage` chart ships only a placeholder image; the `normenermittlung` module has no published v0.2.1 image | Both disabled via flag (documented gap) |
-| The upstream default `VLLM_MODEL=self-hosted/gpt-oss-120b` points the **vision** stage at a **text-only** model — with any backend that enforces modalities, every VLM element fails and there is no flag to skip the stage (observed: Bedrock 400 "image content block", document fails after successful extraction) | Overlay points `VLLM_MODEL` at `self-hosted/pixtral-large` (vision-capable, served by LiteLLM); everything else keeps upstream names |
-| The lookup-data seeds (`python -m src.scripts.seed_data` for project-logic, formal-completeness, administrative-file-draft) are only wired in the upstream process-compose dev setup — the Helm charts do not include them, so a fresh cluster starts with empty lookup tables (observed: the UI cannot load procedure types) | Local `helm/seed-jobs` chart: a post-install/upgrade hook job waits for each service rollout and runs the idempotent upstream seed **inside the running service pod** (same image, same env — no wiring duplicated); deployed as its own release after the umbrella |
-| Helm replaces lists: a custom `extraEnv` **displaces** the umbrella defaults (DB_NAMEs and model names disappeared) | The overlay carries the **complete union** of umbrella defaults + demo overrides; all `${...}` values quoted (the K8s API rejects unquoted numbers: `EnvVar.value` must be a string) |
+| 0.3.0 drops the spicedb, qdrant, docling and redis charts and expects an authzed **spicedb-operator** in the cluster (`environment-config` renders a `SpiceDBCluster` CR), an external Qdrant (`<qdrant-host>`) and an external Docling (`<docling-host>`) | SpiceDB as a plain Deployment in the platform chart (`ghcr.io/authzed/spicedb:v1.51.0`, the version the 0.2.x operator chart pinned; migrate init container; `environment-config.spicedb.enabled=false`); Qdrant from the official chart 1.17.0 on the dedicated node pool; Docling from the 0.2.3 `docling-rq` chart vendored into `helm/docling-rq` (EUPL-1.2, THIRD_PARTY_NOTICES) with ElastiCache Valkey as broker |
+| `modul-rechtsmethodik` requires ten `LAW_DATABASE_*` URLs that the 0.3.0 chart no longer sets (`LAW_DATABASE Field required`, CrashLoop); `modul-inhaltsextraktion` requires `DMS_BASE_URL`, set by no 0.3.0 values file | Overlay sets both; the law-database URLs and DMS go through the machine-identity proxy (the legal-data services run `AUTH_MODE=strict` too and the module sends no credential) |
+| The seeded law database (`gesetze_normen`, upstream dump) carries federal law only; the sample procedure's legal basis names four North-Rhine-Westphalian state laws (`LFoG NRW`, `LJG NRW`, `LPlG NRW`, `DSchG NRW`) | Their norm deconstruction fails with `No document found for jurabk` and the material check shows those norms without results (27 of 76 norm runs on the from-zero proof); the federal norms complete. Data gap of the seed, not of the deployment — a fuller dump or the state-law import is an upstream topic |
+| `CHUNKING_MODEL` placeholder `<llm-model-name>` on the two data services suggests the chat model; the chunking client **embeds** at startup (observed: LiteLLM 500 "Unable to determine bedrock embedding provider for openai.gpt-oss-120b", CrashLoop) | `CHUNKING_MODEL=self-hosted/bge-m3`, the value the 0.2.3 charts carried |
+| `llm-client` with `ENV` other than `dev` requires `QUEUE_NAME`, `QUEUE_MAX_CONCURRENT`, `QUEUE_MAX_PER_SECOND` (ValueError) and nothing sets them | Overlay: `llm-custom` 8/20 (`.env.local` values of upstream), `llm-ionos` 4/10 |
+| Helm replaces lists: a custom `global.extraEnv` **displaces** upstream's `AUTH_*` block, and a leaf chart's own `env` wins over `global.extraEnv`, so every leaf placeholder (`<otel-collector-host>`, `<temporal-host>`, `<s3-region>`, `<qdrant-url>`, `<docling-host>`, `<litellm-api-url>`) survives unless that chart's `extraEnv` overrides it | The overlay re-lists the `AUTH_*` block and overrides every placeholder per chart; `.kiro/tools/render-workflow.sh` greps the render for `value: <...>` and the only acceptable count is 0 |
+| `environment-config` renders NetworkPolicies that allow egress to 53/443 and 5432 into 10.0.0.0/8 only (Keycloak/LiteLLM/SpiceDB in the platform namespace, Valkey 6379, Bedrock unreachable) and an otel-collector with traces only (every pool warned `OTLP metric export failed … Unimplemented` every 10 s) | `networkPolicy.enabled=false` (demo trade-off, THREAT-MODEL R-2), `otel.pipelines.metrics=true` |
+| `db-init` refuses every database name that does not start with `<stage>-` (`guard.namePattern`) and creates no roles | `guard.namePattern: ""` for the upstream-local names on a dedicated RDS instance; roles from the platform chart's `db-roles` job (section A) |
+| Registry repository names differ from the 0.3.0 values (`frontend-app`, `anonymisierung-module`, `clamav-api`, … do not exist on `registry.opencode.de`; `fallvergleichsservice`, `norm-tbm-spec-module`, `landingpage`, `frontend-demo-app` have no repository at all) | Images pinned under the 0.2.x repository names with tag `v0.3.0` (`frontend`, `modul-*`, `*-db-service`, `llm-client`, `rechtsaenderungs-monitoring`, `spark-backend`); ClamAV from `ghcr.io/devhatro/clamav-api:v2.0.0` (the image the 0.2.3 chart named); `fallvergleichsservice`, `modul-normenermittlung`, `landingpage`, `prototype-demo` disabled |
+| Default pool size: two replicas per pool (30 pods) | One replica per pool in the demo (`backend-services.<pool>.replicaCount: 1`) |
+| The three worker pools exit at cold start when the Temporal namespace `default` does not exist yet (`Namespace default was not found`, exit 1) | Nothing to do: the namespace is created by the chart seconds later and Kubernetes restarts the pool (observed: 2–3 restarts of agent-orchestration, dms and project-logic within the first minute, then stable) |
+| The upstream default `VLLM_MODEL`/`VLM_SUMMARY_MODEL_NAME` point the **vision** stages at models that are not on Bedrock | Overlay points both at `self-hosted/pixtral-large` (vision-capable, served by LiteLLM); everything else keeps upstream names |
 
-### E. Behavior of the published v0.2.1 images
+### E. Behavior of the published v0.3.0 images
 
 | Problem (observed) | Demo configuration |
 |---|---|
+| The v0.3.0 Python images run on a **shell-less minimal base**: an `exec` probe with `sh -c` errors "executable file not found", the pod reads 0/1 and is restarted every 10 min (observed from zero on all 11 worker deployments) | The worker probes run in the image's own `python -c` (same check: an established connection to the Temporal frontend, port 7233 = 0x1C41 in `/proc/1/net/tcp`) |
 | `modul-inhaltsextraktion` bakes in `TRANSFORMERS_OFFLINE=1` but does **not** contain the expected model cache → the guard model load crashes | `TRANSFORMERS_OFFLINE=0`/`HF_HUB_OFFLINE=0` + `HF_HOME=/tmp/hf` (non-root without HOME: default cache `/.cache` not writable → `PermissionError`) |
 | `INJECTION_MODEL_TOKEN` requires `min_length=1` but is a bearer token for an **external** guard service (not part of the demo) | Non-empty placeholder; `INJECTION_MODEL_URL` points to localhost (flow documented as limited) |
-| The frontend image templates `VITE_*` into `/usr/share/nginx/html` at startup and binds port 80 → `Permission denied` with the chart default user 65532 | `podSecurityContext` override to root — **documented demo deviation** (the upstream fix would be `--chown` in the image build + port ≥1024) |
+| The frontend image templates `VITE_*` into `/usr/share/nginx/html` at startup (`sed -i`) and binds port 80 → `Permission denied` with the chart's restricted defaults (uid 65532, read-only root FS); unchanged between v0.2.3 and v0.3.0 (Dockerfile has no `USER`, nginx listens on 80) | `podSecurity.restricted: false` + `podSecurityContext` override to root — **documented demo deviation** (the upstream fix would be `--chown` in the image build + port ≥1024) |
 | TEI/BGE-M3: warmup allocates for the full `max-batch-tokens` (16384) → OOMKilled even with 16 Gi | `--max-batch-tokens=4096` + 16 Gi limit |
-| Modules validate `OTEL_ENDPOINT` with `min_length=1`, the umbrella partly sets `""` | Upstream local convention `http://localhost:4317` (the exporter degrades silently); a real collector = phase 2 |
+| Modules validate `OTEL_ENDPOINT` with `min_length=1` | The otel-collector of the upstream `environment-config` chart (`http://otel-collector.<ns>:4317`, debug exporter, metrics pipeline on) |
 | The SPA ships client-side origin allowlists for presigned storage URLs (`VITE_ALLOWED_UPLOAD_ORIGINS`, `VITE_ALLOWED_DOWNLOAD_ORIGINS`) that default to empty | Both set to the regional S3 endpoint in the frontend values — with an empty allowlist the SPA blocks every upload/download client-side before any request is sent (observed: "Hochladen fehlgeschlagen" although presigned URL generation succeeded and S3 never saw a request) |
 | Temporal workers (`modul-*`, `llm-client`) connect to the Temporal frontend **once** at startup; when the frontend is not up yet, the worker coroutine dies with `RuntimeError: Failed client connect … Connection refused`, but the process and its health server stay alive, so the pod reads `Running 1/1` while nothing polls its task queue (observed after `make apply` from zero: 16 of 16 module pods and 3 of 3 `llm-client` pods dead for 30 min, `temporal task-queue describe` listed zero pollers, every uploaded document stayed `Scheduled`; a `rollout restart` fixed each one). The charts expose no worker-health endpoint and no init-container hook | Overlay sets an `exec` startup probe (10 min window) and liveness probe (3 × 30 s) on the 10 worker deployments that test the one observable fact: an established connection to the frontend (`grep ':1C41 01' /proc/1/net/tcp`, 0x1C41 = 7233). Verified: all 19 pods start with 0 restarts; with the frontend scaled to 0 all 19 are restarted by the liveness probe within 2 min, and after it returns every pod reconnects via the startup probe within 10 min |
-| `temporal-job-service`'s chart startup probe allows 60 s (6 × 10 s); at cold start the alembic migration plus the Temporal connect take about that long under the 150m CPU limit (observed: both replicas killed by the startup probe 5–6 times, `connection refused` on `/startup`, uvicorn listening the moment SIGTERM arrived; Ready after 7 min) | `startupProbe.failureThreshold: 30` in the overlay (map merge keeps the chart's `httpGet`) |
+| The 15 spark-backend pools share one image and one ConfigMap; `/startup` turns green only after migrations, seeds and the SpiceDB schema write (300 s window, chart default) | Nothing to change; the worker pools' exits before the Temporal namespace exists are in section D |
 
-#### Image tags per service (submodule at v0.2.3)
+#### Image tags (submodule at v0.3.0)
 
-The submodule is pinned to the upstream release tag **v0.2.3**
-(2026-10-12), the last release before the 0.3.0 restructuring. Between our
-previous pin and v0.2.3 nothing in the Helm charts, the Keycloak bootstrap
-script, the frontend routing contract or the seed scripts changed (the
-chart tree is byte-identical), so the overlay below is unchanged apart from
-image tags. The upstream charts still default every image to `v0.2.1`
-(the 0.2.3 changelog says otherwise; upstream-issue candidate), and the
-openCode registry only publishes a `v0.2.3` image for part of the
-services. The overlay therefore pins per service:
+The submodule is pinned to the upstream release tag **v0.3.0** (2026-10-14).
+Every image the demo runs carries that tag on the openCode registry under
+the 0.2.x repository names (the 0.3.0 values files name repositories that
+do not exist there, section D):
 
-| Image tag | Services | Note |
+| Image tag | Images | Note |
 |---|---|---|
-| **v0.2.3** (12) | frontend, document-management-service, agent-orchestration-service, administrative-file-draft, comment-service, examination-service, feedback-service, formal-completeness-check, fpp-service, identity-management-service, objections-management-service, plausibility-notes | Carries the 0.2.3 fixes we care about: document management signs internal upload URLs with `S3_ENDPOINT_URL` (we set `S3_ENDPOINT_URL` and `S3_EXTERNAL_URL` to the same regional endpoint, nothing to change) and the CVE dependency bumps. Python services now run on the ZenDiS hardened `python3:3.13-minimal` base; the venv stays on `PATH`, so the seed runner's `kubectl exec … python -m src.scripts.seed_data` keeps working |
-| v0.2.1 (18) | project-logic-service, protocol-service, supplementary-requests-service, temporal-job-service, all `modul-*`, llm-client, gesetze-normen-/gesetzesbegruendung-/jura-db-service, rechtsaenderungs-monitoring | No `v0.2.3` image published; the next tag is `v0.3.0` from the restructured tree, which does not fit the 0.2.x charts. Consequence: the 0.2.3 **security fix for PII redaction (upstream issue #40, `modul-anonymisierung`)** and the prompt-schema fix (`modul-formale-pruefung`) are **not** in this deployment — see `../docs/THREAT-MODEL.md` B-4 |
-| none | landingpage, normenermittlung | Still no published image (disabled, section D) |
+| **v0.3.0** (16) | `spark-backend` (one image, 15 pools), `frontend`, `modul-anonymisierung`, `modul-bewertung`, `modul-einwendungsmanagement`, `modul-formale-pruefung`, `modul-inhaltsextraktion`, `modul-plausibilitaet-pruefung`, `modul-rechtsmethodik`, `modul-risikohinweiser`, `modul-suche-und-zuordnung`, `gesetze-normen-db-service`, `gesetzesbegruendung-db-service`, `jura-db-service`, `llm-client`, `rechtsaenderungs-monitoring` | The 0.2.3 PII-redaction fix (`modul-anonymisierung`, upstream issue #40) and the prompt-schema fix (`modul-formale-pruefung`) are in this deployment — THREAT-MODEL B-4 closed for the modules |
+| other | `unoserver:3.5` (openCode), `ghcr.io/devhatro/clamav-api:v2.0.0`, `ghcr.io/authzed/spicedb:v1.51.0`, `qdrant/qdrant` (chart 1.17.0), `quay.io/docling-project/docling-serve-cpu:v1.14.3`, `temporalio/*:1.31.2`, `otel/opentelemetry-collector-contrib:0.145.0`, `public.ecr.aws/nginx/nginx-unprivileged:1.29-alpine` | Pinned in the overlay, the platform chart and the app-workflow module |
+| none | `fallvergleichsservice`, `modul-normenermittlung`, `landingpage`, `prototype-demo` | No published image (disabled, section D) |
 
-Within the 0.2.x line there is no API-contract change between the two
-tags, so the mixed set is uncritical. Verified statically (`helm template`
-of the staged charts with this overlay through the postrenderer: 105
-resources, the postrenderer removes exactly the three expected lines, 12 ×
-`v0.2.3` / 18 × `v0.2.1` image references) and **verified live** on
-2026-10-20 with `make apply` from zero (195 resources, 25 min, one
-attempt): `scripts/verify.sh` green (6/6), scripted OIDC login with a
-cookie jar (Keycloak form → Envoy callback → `/app/` 200, unauthenticated
-API call → 302), project created, `demo-data/*.zip` uploaded through the
-presigned-URL sequence of the SPA (generate URL → PUT → confirm → start
-processing), `FileProcessingWorkflow` and `FVPWorkflow` completed (54
-Temporal workflows), 64 `openai.gpt-oss-120b-1:0` and 10
-`eu.mistral.pixtral-large-2502-v1:0` Bedrock invocations in `eu-central-1`
-for one two-document ZIP, both documents assigned to a required document
-type by the formal completeness check. The seed runner's `kubectl exec …
-python -m src.scripts.seed_data` on the ZenDiS minimal base images printed
-`All seeds completed.`. The two cold-start findings of that run are the
-last two rows of the table above.
+Verified statically (`.kiro/tools/render-workflow.sh`: 113 resources, 0
+upstream placeholders left in any env value, 30 × v0.3.0 image references)
+and **verified live from zero** on 2026-10-20 (destroy → `make apply` on an
+empty account, 195 resources, 26 min, one attempt): `scripts/verify.sh` 6/6
+(64 pods Ready, 15 pools, Temporal pollers on seven task queues, both
+SecurityPolicies accepted), login through the Keycloak form with a cookie jar
+(the Identity Provider Redirector of the optional corporate SSO bypassed with
+`kc_idp_hint`, the path a customer without SSO takes), project created,
+`demo-data/*.zip` uploaded through the SPA's presigned-URL sequence,
+`FileProcessingWorkflow` → `process-documents-workflow` → `FVPWorkflow`: 54 of
+54 Temporal workflows completed, both documents assigned by the formal
+completeness check (confidence 0.99 and 0.95, 0 unassigned), 56
+`openai.gpt-oss-120b-1:0` and 17 `eu.mistral.pixtral-large-2502-v1:0`
+Bedrock invocations in `eu-central-1` for one two-document ZIP.
+
+A second from-zero cycle on 2026-10-21 00:00 UTC (after the three fixes of
+the evening: cookie drop, law-database routing, findings workflow) ran the
+same path again on the first attempt — 195 resources, `verify.sh` 7/7,
+formal check 0.99/0.96 — and then the material completeness check: the norm
+deconstruction (`BatchMVPWorkflow`) completed for every norm whose law the
+seeded database carries, and one findings run (`suche_zuordnung_norm`, 31
+Satz nodes, started as the norm card does) completed with 53 Fundstellen in
+the project.
 
 ### F. Data protection and hardening defaults (deployment layer)
 
@@ -336,7 +348,7 @@ in this repo's layer; none of it changes what the upstream charts deploy.
 
 - **EKS provider tokens expire after 15 min.** Long applies (node rollouts, Helm upgrade across ~20 deployments) can abort with `Unauthorized` → renew the AWS session and **repeat the same command**; all steps are idempotent.
 - **Increasing `node_count` afterwards:** The EKS module ignores `desired_size` changes (autoscaler convention). Run `aws eks update-nodegroup-config ... --scaling-config` once to catch up, then `make apply`.
-- **Teardown:** `make destroy` — buckets have `force_destroy`, secrets `recovery_window=0`, the KMS key a 7-day deletion window. (A complete destroy→apply cycle is still open as task 6.3.)
+- **Teardown:** `make destroy` — buckets have `force_destroy`, secrets `recovery_window=0`, the KMS key a 7-day deletion window. The complete destroy → apply cycle was run hands-off twice on 2026-10-20 (destroy 197 of 197 and 195 of 195 resources, apply 195 resources in 25 min each).
 - **Applying this hardening to an environment created before it:** the KMS key, versioning, lifecycle, log groups and monitoring role are additive. Two changes replace resources: ElastiCache gets `kms_key_id` (replication group re-created, the RQ broker is stateless) and the Secrets Manager entries change their encryption key in place. Expect one RDS modification for the log exports/monitoring (`apply_immediately`).
 
 ## Directory layout
@@ -345,8 +357,8 @@ in this repo's layer; none of it changes what the upstream charts deploy.
 spark-workflow-demo/
 ├── spark-workflow/    # Upstream (git submodule, EUPL-1.2) — do not modify
 ├── terraform/         # IaC: VPC, EKS, RDS, S3, ElastiCache, Secrets, Addons
-├── helm/              # Demo values/overrides for the upstream charts
-├── scripts/           # Helper scripts (seed, smoke tests)
+├── helm/              # Demo overlay (values/), platform chart, cluster-config, vendored docling-rq
+├── scripts/           # verify.sh (deployment verification)
 ├── docs/              # Architecture and operations docs for the demo
 ├── CHANGELOG.md
 ├── LICENSE            # MIT-0 (demo code only)

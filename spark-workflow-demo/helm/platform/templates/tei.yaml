@@ -28,6 +28,11 @@ spec:
             # BGE-M3 (8192 seq len) warmup allocates for the full max batch:
             # the 16384-token default OOMs CPU pods — cap it demo-appropriately.
             - --max-batch-tokens={{ .Values.tei.maxBatchTokens }}
+            # Requests per call the router accepts (default 32): the
+            # suche-und-zuordnung module embeds its research passages in
+            # batches of 40 ("batch size 40 > maximum allowed batch size 32",
+            # observed 2026-10-20, the findings workflow failed on it).
+            - --max-client-batch-size={{ .Values.tei.maxClientBatchSize }}
             - --auto-truncate
           env:
             - name: HF_HOME

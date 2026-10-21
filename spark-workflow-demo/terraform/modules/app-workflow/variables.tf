@@ -1,5 +1,5 @@
 variable "umbrella_chart_path" {
-  description = "Path to the upstream 00-spark-workflow umbrella chart (inside the submodule)."
+  description = "Path to the staged upstream spark-platform umbrella chart (00-umbrella/spark-platform)."
   type        = string
 }
 
@@ -13,6 +13,17 @@ variable "postrender_script_path" {
   type        = string
 }
 
+variable "docling_chart_path" {
+  description = "Path to the docling-rq chart (vendored from upstream 0.2.3, helm/docling-rq)."
+  type        = string
+}
+
+variable "qdrant_chart_version" {
+  description = "Version of the official qdrant Helm chart (https://qdrant.github.io/qdrant-helm)."
+  type        = string
+  default     = "1.17.0"
+}
+
 variable "release_name" {
   description = "Helm release name (prefixes all app resource names)."
   type        = string
@@ -20,9 +31,24 @@ variable "release_name" {
 }
 
 variable "app_namespace" {
-  description = "Target namespace of the application."
+  description = "Target namespace of the application (every layer of the umbrella)."
   type        = string
   default     = "spark"
+}
+
+variable "platform_namespace" {
+  description = "Namespace of the platform chart (Keycloak, LiteLLM, SpiceDB)."
+  type        = string
+}
+
+variable "cluster_secret_store" {
+  description = "ESO ClusterSecretStore name (the upstream db-init chart reads the RDS admin credentials through it)."
+  type        = string
+}
+
+variable "rds_master_secret_name" {
+  description = "Secrets Manager entry holding the RDS master credentials (properties username/password)."
+  type        = string
 }
 
 variable "hosts" {
@@ -47,9 +73,18 @@ variable "keycloak_client_id" {
 }
 
 variable "auth_mode" {
-  description = "Service-level auth mode (disabled | optional_verify_dry_run | strict). Demo default: tokens are verified against Keycloak so identity endpoints work, SpiceDB permission checks run in dry-run (upstream-designed mode for exactly this setup)."
+  description = "Service-level auth mode of the backend pools (0.3.0 accepts strict | disabled). strict: the token Envoy forwards after the perimeter login is verified by every pool and SpiceDB permissions are enforced; disabled leaves /api/identity/me without a user."
   type        = string
-  default     = "optional_verify_dry_run"
+  default     = "strict"
+  validation {
+    condition     = contains(["strict", "disabled"], var.auth_mode)
+    error_message = "auth_mode must be strict or disabled (the 0.2.x dry-run mode no longer exists)."
+  }
+}
+
+variable "system_user_id" {
+  description = "UUID the backend records as the system actor (SYSTEM_USER_ID); the demo uses the demo user's Keycloak id."
+  type        = string
 }
 
 variable "rds_host" {
@@ -79,7 +114,7 @@ variable "bucket_names" {
 }
 
 variable "vlm_model_name" {
-  description = "LiteLLM model name for the VLM enhancement stage (VLLM_MODEL override)."
+  description = "LiteLLM model name for the vision stages (VLLM_MODEL / VLM_SUMMARY_MODEL_NAME)."
   type        = string
 }
 
@@ -87,12 +122,6 @@ variable "litellm_url" {
   description = "In-cluster LiteLLM base URL (OpenAI-compatible, incl. /v1)."
   type        = string
   default     = "http://litellm.spark-platform.svc.cluster.local:4000/v1"
-}
-
-variable "valkey_enabled" {
-  description = "Use ElastiCache Valkey as docling-rq broker."
-  type        = bool
-  default     = true
 }
 
 variable "gpu_enabled" {
@@ -118,16 +147,3 @@ variable "docling_tag" {
   type        = string
   default     = "v1.14.3"
 }
-
-variable "seed_jobs_chart_path" {
-  description = "Path to the local seed-jobs chart (runs the upstream lookup-data seeds after the umbrella rollout)."
-  type        = string
-}
-
-variable "seed_jobs_enabled" {
-  description = "Run the upstream lookup-data seeds (project types, statuses, ...) after each umbrella change. Disable for clusters where lookup data is managed manually."
-  type        = bool
-  default     = true
-}
-
-

@@ -2,11 +2,98 @@
 # created by the terraform k8s-addons module; external-dns publishes the
 # hostnames from these HTTPRoutes into Route53.
 #
-# API routing mirrors the upstream frontend contract (configureClients.ts +
-# vite dev proxy): the SPA calls ${VITE_API_BASE_URL}<prefix>/..., the
-# platform strips /api plus the client prefix (except /temporal, which the
-# temporal-job-service expects to keep) and forwards to the backend service
-# in the app namespace.
+# API routing follows the upstream 0.3.0 contract (the gateway-routes chart's
+# dashboard-api routes, which the demo does not install — design.md): the SPA
+# calls ${VITE_API_BASE_URL}<module>/..., i.e. /api/<module>/v1/... and
+# /api/v2/<module>/..., and the spark-backend pool that owns the module
+# receives the path UNCHANGED (the modulith serves every route under /api).
+# Only /api/law-changes/v1 (a separate service) is rewritten to its root.
+#
+# Kubernetes allows 16 rules per HTTPRoute, so the v1 and v2 sets are two
+# routes; Gateway API matches the longest path prefix ACROSS all routes of a
+# hostname, so the API prefixes win over the SPA fallback below.
+{{- $root := . }}
+{{- range $set := list (dict "name" "frontend-api-v1" "routes" .Values.apiRoutesV1) (dict "name" "frontend-api-v2" "routes" .Values.apiRoutesV2) }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $set.name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels: {{- include "spark-platform.labels" $root | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ $root.Values.gateway.name }}
+      namespace: {{ $root.Values.gateway.namespace }}
+  hostnames:
+    - {{ $root.Values.hosts.frontend }}
+  rules:
+    {{- range $set.routes }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api{{ .prefix }}
+      # The Cookie header is dropped: the gateway has verified the session and
+      # hands the pools the user's token as Authorization: Bearer
+      # (forwardAccessToken); the 0.3.0 backend reads no cookie. A browser that
+      # still carries the session cookies of earlier deployments (one ~4.5 KB
+      # set per re-created gateway) otherwise gets 431 from the Bun server
+      # (observed 2026-10-20 on /api/identity/me and /users).
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove: [Cookie]
+      {{- if .rewrite }}
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: {{ .rewrite | quote }}
+      {{- end }}
+      {{- if .timeout }}
+      timeouts:
+        request: {{ .timeout }}
+        backendRequest: {{ .timeout }}
+      {{- end }}
+      backendRefs:
+        - name: {{ $root.Values.appReleaseName }}-{{ .service }}
+          namespace: {{ $root.Values.appNamespace }}
+          port: {{ .port | default 80 }}
+    {{- end }}
+{{- end }}
+---
+# Prometheus endpoints of the pools are not for the internet (upstream blocks
+# them the same way in its gateway-routes chart). Longest-prefix matching
+# puts these rules ahead of the /api/... rules above.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frontend-metrics-denied
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "spark-platform.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Values.gateway.namespace }}
+  hostnames:
+    - {{ .Values.hosts.frontend }}
+  rules:
+    - matches:
+        {{- range .Values.metricsPaths }}
+        - path:
+            type: Exact
+            value: {{ . }}
+        - path:
+            type: PathPrefix
+            value: {{ . }}/
+        {{- end }}
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: deny-admin-surface
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -20,53 +107,19 @@ spec:
   hostnames:
     - {{ .Values.hosts.frontend }}
   rules:
-    {{- range .Values.apiRoutes }}
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /api{{ .prefix }}
-      filters:
-        - type: URLRewrite
-          urlRewrite:
-            path:
-              type: ReplacePrefixMatch
-              replacePrefixMatch: {{ .rewrite | default "/" | quote }}
-      backendRefs:
-        - name: {{ $.Values.appReleaseName }}-{{ .service }}
-          namespace: {{ $.Values.appNamespace }}
-          port: {{ .port | default 80 }}
-    {{- end }}
-    # SPA fallback: everything else is served by the frontend nginx.
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /
-      backendRefs:
-        - name: {{ .Values.appReleaseName }}-frontend
-          namespace: {{ .Values.appNamespace }}
-          port: {{ .Values.frontendServicePort }}
----
-# SPA under /app: the frontend image templates VITE_BASE_URL=/app into
-# index.html, but its nginx serves from the web root (/assets/...) — strip
-# the prefix at the gateway (mirrors the upstream Envoy setup). Without
-# this, /app/ loads via the nginx SPA fallback but every asset request
-# 404s (observed: blank page, all /app/assets/*.js 404).
-# Separate HTTPRoute because the frontend route already carries 16 rules
-# (the Kubernetes maximum); Gateway API matches by longest path prefix
-# across all routes of the same hostname, so /app wins over /.
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: frontend-app
-  namespace: {{ .Release.Namespace }}
-  labels: {{- include "spark-platform.labels" . | nindent 4 }}
-spec:
-  parentRefs:
-    - name: {{ .Values.gateway.name }}
-      namespace: {{ .Values.gateway.namespace }}
-  hostnames:
-    - {{ .Values.hosts.frontend }}
-  rules:
+    # SPA under /app: the image is built with VITE_APP_BASE_PATH=/app (assets
+    # referenced as /app/assets/...) while its nginx serves from the web root
+    # — strip the prefix at the gateway, exactly as the upstream
+    # gateway-routes chart does (httproute-dashboard.yaml). Without this
+    # every asset request 404s (observed on 0.2.x: blank page).
+    #
+    # The Cookie header is dropped before the static server: the gateway has
+    # already verified the session, nginx never needs the tokens, and its
+    # default 8 KB per-header limit answers "400 Request Header Or Cookie Too
+    # Large" to a browser that still carries the session cookies of earlier
+    # deployments (Envoy Gateway suffixes its cookie names per SecurityPolicy
+    # instance, so every re-created gateway adds a ~4.5 KB set; observed
+    # 2026-10-20 after the third deployment of the day).
     - matches:
         - path:
             type: PathPrefix
@@ -77,6 +130,23 @@ spec:
             path:
               type: ReplacePrefixMatch
               replacePrefixMatch: /
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove: [Cookie]
+      backendRefs:
+        - name: {{ .Values.appReleaseName }}-frontend
+          namespace: {{ .Values.appNamespace }}
+          port: {{ .Values.frontendServicePort }}
+    # Everything else (the apex included) is served by the frontend nginx,
+    # whose SPA fallback renders index.html for any path.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove: [Cookie]
       backendRefs:
         - name: {{ .Values.appReleaseName }}-frontend
           namespace: {{ .Values.appNamespace }}
@@ -120,7 +190,7 @@ spec:
     contentType: text/plain
     body:
       type: Inline
-      inline: "Forbidden: the Keycloak admin surface is not exposed publicly.\n"
+      inline: "Forbidden: this surface is not exposed publicly.\n"
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -139,9 +209,9 @@ spec:
     # Scope is deliberately /admin/master and NOT /admin: Keycloak serves
     # the console for EVERY realm under /admin/master/console, while the
     # token-protected admin REST API lives under /admin/realms/<realm> —
-    # and identity-management-service calls exactly that through the public
-    # hostname (AUTH_BASE_URL), so a blanket /admin deny would break user
-    # management (GET /users 500).
+    # and the identity module of the backend calls exactly that through the
+    # public hostname (AUTH_BASE_URL), so a blanket /admin deny would break
+    # user management.
     - matches:
         - path:
             type: PathPrefix
@@ -167,7 +237,7 @@ spec:
             name: deny-admin-surface
 ---
 # Allow HTTPRoutes in the platform namespace to reference Services in the
-# app namespace (frontend, API services, temporal web).
+# app namespace (frontend, API pools, temporal web).
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
 metadata:
@@ -204,9 +274,11 @@ spec:
 {{- end }}
 {{- if .Values.oidcPolicy.enabled }}
 ---
-# Perimeter login via Envoy Gateway native OIDC (replaces oauth2-proxy in the
-# request path — same pattern the upstream architecture describes: Envoy +
-# OIDC identity provider). Keycloak itself stays public for the login flow.
+# Perimeter login via Envoy Gateway native OIDC (same pattern the upstream
+# architecture describes: Envoy + OIDC identity provider). Keycloak itself
+# stays public for the login flow. forwardAccessToken hands the user's
+# access token to the pools as a Bearer header, which AUTH_MODE=strict
+# verifies against the realm.
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: SecurityPolicy
 metadata:
@@ -215,14 +287,17 @@ metadata:
   labels: {{- include "spark-platform.labels" . | nindent 4 }}
 spec:
   targetRefs:
-    # Both routes serve the same hostname, so one policy with one
-    # redirectURL covers them (cookies are host-scoped, not route-scoped).
+    # Every route of the frontend host under one policy with one
+    # redirectURL (cookies are host-scoped, not route-scoped).
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
       name: frontend
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
-      name: frontend-app
+      name: frontend-api-v1
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: frontend-api-v2
   oidc:
     {{- include "spark-platform.oidcCommon" . | nindent 4 }}
     redirectURL: https://{{ .Values.hosts.frontend }}/oauth2/callback
